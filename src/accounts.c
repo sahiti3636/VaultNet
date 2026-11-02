@@ -289,8 +289,12 @@ int accounts_register(const char *username, const char *password) {
     memset(a, 0, sizeof(*a));
     a->account_id    = g_next_id;
     strncpy(a->username, username, MAX_USERNAME - 1);
-    generate_salt(a->salt, sizeof(a->salt));
-    hash_password(password, a->salt, a->password_hash, sizeof(a->password_hash));
+    if (generate_salt(a->salt, sizeof(a->salt)) != 0 ||
+        hash_password(password, a->salt, a->password_hash,
+                      sizeof(a->password_hash)) != 0) {
+        pthread_rwlock_unlock(&g_reg_rwlock);
+        return -1;
+    }
     a->balance_paise = 0;
     pthread_mutex_init(&a->lock, NULL);
 

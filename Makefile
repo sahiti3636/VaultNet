@@ -7,7 +7,7 @@ LDFLAGS := -pthread
 UNAME := $(shell uname)
 OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null)
-ifeq ($(OPENSSL_CFLAGS),)
+ifeq ($(OPENSSL_LIBS),)
   ifeq ($(UNAME), Darwin)
     OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || echo /usr/local)
     OPENSSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
@@ -85,7 +85,7 @@ $(BINDIR):
 # ── sanitizer builds ──────────────────────────────────────────────────────
 
 # ThreadSanitizer: detects data races and lock-order violations.
-tsan:
+tsan: | $(BINDIR)
 	$(CC) -Wall -Wextra -Werror -pthread -O1 -g -std=c11 -D_GNU_SOURCE \
 	    $(OPENSSL_CFLAGS) -fsanitize=thread \
 	    -I$(SRCDIR) $(SERVER_SRCS) -o $(BINDIR)/vaultnet_server_tsan $(LDFLAGS) \
@@ -96,7 +96,7 @@ tsan:
 	    -fsanitize=thread
 
 # AddressSanitizer + UBSan: detects memory errors and undefined behaviour.
-asan:
+asan: | $(BINDIR)
 	$(CC) -Wall -Wextra -Werror -pthread -O1 -g -std=c11 -D_GNU_SOURCE \
 	    $(OPENSSL_CFLAGS) -fsanitize=address,undefined \
 	    -I$(SRCDIR) $(SERVER_SRCS) -o $(BINDIR)/vaultnet_server_asan $(LDFLAGS)
