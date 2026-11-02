@@ -12,7 +12,7 @@ optional TLS 1.2+, and a load generator with latency percentiles — all under `
 |---|---|
 | **Concurrency** | 64-worker bounded thread pool; `pthread_rwlock_t` + per-account `pthread_mutex_t`; strict lock-ordering to prevent deadlocks |
 | **Durability** | Binary WAL (write-ahead log) with CRC-32, group commit, and crash recovery; atomic `rename()` snapshots |
-| **Auth** | PBKDF2-HMAC-SHA256 (100 000 iterations, 32-byte key, `RAND_bytes` salt, `CRYPTO_memcmp` constant-time verify) |
+| **Auth** | PBKDF2-HMAC-SHA256 (600 000 iterations for new hashes, 32-byte key, `RAND_bytes` salt, `CRYPTO_memcmp` constant-time verify) |
 | **Transport** | Optional TLS 1.2+ via OpenSSL `VNConn` abstraction; plaintext fallback; `--tls` client flag |
 | **Precision** | Integer money in `int64_t` paise (1/100 of a unit) — no floating-point arithmetic |
 | **Networking** | epoll-based accept loop on Linux with self-pipe shutdown; `accept()`-loop fallback on macOS |
@@ -161,7 +161,7 @@ Example session:
 
 ## Testing
 
-### Unit tests (37 assertions)
+### Unit tests (39 assertions)
 
 ```bash
 make unit
@@ -262,7 +262,9 @@ Latency  p99       : 41281 µs
 Latency  max       : 56010 µs
 ```
 
-Each acknowledged write waits for a WAL `fsync()`. Independent account mutations
+The figures above were measured before the PBKDF2 work factor changed from
+100,000 to 600,000 iterations. Each acknowledged write waits for a WAL `fsync()`.
+Independent account mutations
 can now queue records concurrently, and the WAL writer reports records, `fsync`
 calls, and average batch size on shutdown. In an 8-second local run on an Apple
 M3 Pro with internal SSD, the old lock design had a 1.00 average batch at 64
@@ -325,9 +327,13 @@ LSN tracking uses `_Atomic uint64_t g_last_lsn` (safe under TSan).
 `src/auth.c` implements PBKDF2-HMAC-SHA256:
 
 - 16-byte random salt via `RAND_bytes`
-- 100 000 iterations, 32-byte derived key
+- 600 000 iterations for new hashes, 32-byte derived key
 - Stored in separate salt and hash fields in the account snapshot and WAL
+- New hashes carry their iteration count (`pbkdf2_sha256$600000$<hex>`);
+  the old 100,000-iteration bare-hex format remains readable
 - Verification uses `CRYPTO_memcmp` (constant-time) to prevent timing attacks
+- Login copies the salt and hash under the account lock, then runs PBKDF2
+  after releasing it, so balance operations are not blocked by hashing
 
 ### TLS abstraction (`VNConn`)
 
@@ -367,7 +373,7 @@ src/
   threadpool.c  Bounded circular-queue thread pool (64 workers, 256-slot queue)
 
 tests/
-  unit.c        37-assertion unit test suite (no server process required)
+  unit.c        39-assertion unit test suite (no server process required)
   loadgen.c     C load generator with latency percentiles
   crash_test.sh Crash recovery integration test
   tls_smoke.sh  TLS end-to-end smoke test

@@ -34,7 +34,7 @@ done
 [[ -z "$NC_CMD" ]] && { echo "FATAL: netcat not found"; exit 1; }
 
 send_cmds() {
-    printf '%s\n' "$1" | "$NC_CMD" -w 4 "$HOST" "$PORT" 2>/dev/null || true
+    printf '%s\n' "$1" | "$NC_CMD" -w 15 "$HOST" "$PORT" 2>/dev/null || true
 }
 
 # ── cleanup ────────────────────────────────────────────────────────────────────

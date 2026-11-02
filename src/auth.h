@@ -5,8 +5,10 @@
 #include "protocol.h"
 
 /*
- * PBKDF2-HMAC-SHA256 password hashing (100 000 iterations, 32-byte output).
+ * PBKDF2-HMAC-SHA256 password hashing (600 000 iterations, 32-byte output).
  * Salt is 16 random bytes from OpenSSL RAND_bytes, hex-encoded (32 chars).
+ * New hashes store their work factor; verification also accepts the old
+ * 100 000-iteration bare-hex format for existing accounts.
  * verify_password uses CRYPTO_memcmp for constant-time comparison.
  */
 

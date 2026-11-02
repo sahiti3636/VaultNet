@@ -74,15 +74,15 @@ jobs:
           SRV=$!
           trap 'kill "$SRV" 2>/dev/null || true' EXIT
           sleep 2
-          printf 'REGISTER alice alicepass\nQUIT\n' | nc -w 4 127.0.0.1 18080
-          printf 'REGISTER bob bobpass8\nQUIT\n'   | nc -w 4 127.0.0.1 18080
-          printf 'LOGIN alice alicepass\nDEPOSIT 100000\nLOGOUT\nQUIT\n' | nc -w 4 127.0.0.1 18080
-          printf 'LOGIN bob bobpass8\nDEPOSIT 100000\nLOGOUT\nQUIT\n'   | nc -w 4 127.0.0.1 18080
+          printf 'REGISTER alice alicepass\nQUIT\n' | nc -w 15 127.0.0.1 18080
+          printf 'REGISTER bob bobpass8\nQUIT\n'   | nc -w 15 127.0.0.1 18080
+          printf 'LOGIN alice alicepass\nDEPOSIT 100000\nLOGOUT\nQUIT\n' | nc -w 15 127.0.0.1 18080
+          printf 'LOGIN bob bobpass8\nDEPOSIT 100000\nLOGOUT\nQUIT\n'   | nc -w 15 127.0.0.1 18080
           PIDS=()
           for i in $(seq 1 20); do
-            printf 'LOGIN alice alicepass\nDEPOSIT 10\nLOGOUT\nQUIT\n' | nc -w 4 127.0.0.1 18080 &
+            printf 'LOGIN alice alicepass\nDEPOSIT 10\nLOGOUT\nQUIT\n' | nc -w 15 127.0.0.1 18080 &
             PIDS+=($!)
-            printf 'LOGIN alice alicepass\nTRANSFER bob 10\nLOGOUT\nQUIT\n' | nc -w 4 127.0.0.1 18080 &
+            printf 'LOGIN alice alicepass\nTRANSFER bob 10\nLOGOUT\nQUIT\n' | nc -w 15 127.0.0.1 18080 &
             PIDS+=($!)
           done
           for pid in "${PIDS[@]}"; do wait "$pid"; done
@@ -101,9 +101,9 @@ jobs:
           ASAN_OPTIONS="halt_on_error=1 detect_leaks=1" ./bin/vaultnet_server_asan 18080 &
           SRV=$!
           sleep 1
-          printf 'REGISTER alice alicepass\nQUIT\n' | nc -w 4 127.0.0.1 18080
+          printf 'REGISTER alice alicepass\nQUIT\n' | nc -w 15 127.0.0.1 18080
           printf 'LOGIN alice alicepass\nDEPOSIT 50000\nTRANSFER alice 1000\nBALANCE\nLOGOUT\nQUIT\n' \
-              | nc -w 4 127.0.0.1 18080
+              | nc -w 15 127.0.0.1 18080
           kill $SRV 2>/dev/null || true
           wait $SRV 2>/dev/null || true
           echo "ASan run complete (no memory errors)"

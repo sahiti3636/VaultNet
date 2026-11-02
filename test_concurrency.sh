@@ -44,7 +44,7 @@ trap cleanup EXIT
 # Works with macOS nc (uses -w timeout; server closes socket on QUIT).
 send_cmds() {
     local script="$1"
-    printf '%s\n' "$script" | "$NC_CMD" -w 4 "$HOST" "$PORT" 2>/dev/null || true
+    printf '%s\n' "$script" | "$NC_CMD" -w 15 "$HOST" "$PORT" 2>/dev/null || true
 }
 
 # ── extract balance value from a server response string ───────────────────

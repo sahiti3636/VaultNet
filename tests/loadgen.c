@@ -59,8 +59,8 @@ static int tcp_connect(const char *host, int port) {
     sa.sin_port   = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(fd); return -1; }
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
-    /* 5-second idle timeout */
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    /* Allow concurrent PBKDF2 logins to queue on small CI runners. */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }

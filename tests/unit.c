@@ -11,6 +11,7 @@
 #include "../src/accounts.h"
 #include "../src/wal.h"
 #include "../src/protocol.h"
+#include "../src/auth.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,15 @@ static void test_register_and_auth(void) {
     CHECK("auth alice wrong", accounts_authenticate("alice", "wrongpass") == 0);
     CHECK("auth bob ok",      accounts_authenticate("bob",   "bobpass8")  == 1);
     CHECK("auth unknown",     accounts_authenticate("carol", "pass1234")  == 0);
+
+    char formatted_hash[MAX_HASH];
+    CHECK("new hash has work factor",
+          hash_password("alicepass", "00112233445566778899aabbccddeeff",
+                        formatted_hash, sizeof(formatted_hash)) == 0 &&
+          strncmp(formatted_hash, "pbkdf2_sha256$600000$", 21) == 0);
+    CHECK("legacy 100k hash verifies",
+          verify_password("alicepass", "00112233445566778899aabbccddeeff",
+              "203e5dceb257e1fb116834ff95166d913e163153e8d75824238029c020bdfcbf") == 1);
 
     shutdown_clean();
 }

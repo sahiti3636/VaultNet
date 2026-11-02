@@ -33,6 +33,7 @@
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <openssl/crypto.h>
 
 /* ── global state ─────────────────────────────────────────────────────────── */
 
@@ -409,11 +410,18 @@ int accounts_authenticate(const char *username, const char *password) {
     Account *a = find_account_unlocked(username);
     if (!a) { pthread_rwlock_unlock(&g_reg_rwlock); return 0; }
 
+    char salt[SALT_HEX_LEN], hash[MAX_HASH];
     pthread_mutex_lock(&a->lock);
-    int ok = verify_password(password, a->salt, a->password_hash);
+    memcpy(salt, a->salt, sizeof(salt));
+    memcpy(hash, a->password_hash, sizeof(hash));
     pthread_mutex_unlock(&a->lock);
-
     pthread_rwlock_unlock(&g_reg_rwlock);
+
+    /* Credentials are immutable after registration. Verify the local copies
+     * without holding an account lock across the expensive PBKDF2 call. */
+    int ok = verify_password(password, salt, hash);
+    OPENSSL_cleanse(salt, sizeof(salt));
+    OPENSSL_cleanse(hash, sizeof(hash));
     return ok;
 }
 
