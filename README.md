@@ -13,7 +13,7 @@ optional TLS 1.2+, and a load generator with latency percentiles — all under `
 | **Concurrency** | 64-worker bounded thread pool; `pthread_rwlock_t` + per-account `pthread_mutex_t`; strict lock-ordering to prevent deadlocks |
 | **Durability** | Binary WAL (write-ahead log) with CRC-32, group commit, and crash recovery; atomic `rename()` snapshots |
 | **Auth** | PBKDF2-HMAC-SHA256 (600 000 iterations for new hashes, 32-byte key, `RAND_bytes` salt, `CRYPTO_memcmp` constant-time verify) |
-| **Transport** | Optional TLS 1.2+ via OpenSSL `VNConn` abstraction; plaintext fallback; `--tls` client flag |
+| **Transport** | Optional TLS 1.2+ via OpenSSL `VNConn` abstraction; plaintext mode; `--tls` client flag |
 | **Precision** | Integer money in `int64_t` paise (1/100 of a unit) — no floating-point arithmetic |
 | **Networking** | epoll-based accept loop on Linux with self-pipe shutdown; `accept()`-loop fallback on macOS |
 | **Testing** | 48 unit assertions, concurrency conservation proof, crash-recovery test, TLS smoke test, TSan + ASan builds |
@@ -52,10 +52,11 @@ make unit         # unit test runner →  bin/vaultnet_unit
 make loadgen      # load generator  →  bin/vaultnet_loadgen
 make tsan         # ThreadSanitizer builds
 make asan         # AddressSanitizer + UBSan builds
-make clean        # remove obj/, bin/, and all data files
+make clean        # remove obj/, bin/, and generated repository data/certs
 ```
 
-All targets build with `-Wall -Wextra -Werror -pthread -O2 -std=c11 -D_GNU_SOURCE`.
+Normal targets build with `-Wall -Wextra -Werror -pthread -O2 -std=c11 -D_GNU_SOURCE`.
+Sanitizer targets use `-O1 -g`.
 
 ---
 
@@ -140,6 +141,8 @@ Example session:
 ```
 > REGISTER alice s3cret99
 < OK account created
+> REGISTER bob b0bpass8
+< OK account created
 > LOGIN alice s3cret99
 < OK logged in as alice
 > DEPOSIT 500
@@ -182,11 +185,11 @@ bash test_concurrency.sh
 ```
 
 Spawns 60 concurrent clients (30 depositors + 30 transferrers) against two accounts
-seeded with 100 000 each, then verifies `alice + bob` equals the expected total —
-proving no money is created or destroyed under heavy concurrent access.
+seeded with 100 000 each, then verifies `alice + bob` equals the seeded total
+plus exactly the acknowledged deposits.
 
 ```
-RESULT: PASS – money conserved under 60 concurrent clients
+RESULT: PASS – money exactly conserved under 60 concurrent clients
 ```
 
 ### Multi-account transfer stress
@@ -226,7 +229,7 @@ Requires the server to be running with TLS on the given port. Tests `REGISTER`,
 of a certificate signed by an unrelated CA.
 
 ```
-RESULT: PASS – TLS handshake + REGISTER + DEPOSIT + BALANCE + bad-auth all OK
+RESULT: PASS – verified TLS, banking commands, bad-auth, and wrong-CA rejection
 ```
 
 ### All tests in one command
@@ -240,13 +243,14 @@ Runs unit tests, the two concurrency tests, and crash recovery in sequence.
 ### Sanitizer builds
 
 ```bash
-# ThreadSanitizer — detects data races and lock-order violations
+# ThreadSanitizer — detects data races
 make tsan
 TSAN_OPTIONS=halt_on_error=1 ./bin/vaultnet_server_tsan 18080 &
 # ... drive it with clients ...
 
 # AddressSanitizer + UBSan — detects memory errors and undefined behaviour
 make asan
+# On Linux, leak detection is available:
 ASAN_OPTIONS="halt_on_error=1 detect_leaks=1" ./bin/vaultnet_server_asan 18080 &
 ```
 
@@ -274,11 +278,14 @@ Flags:
 | `-L` | off | Log in once per connection; time transactions only |
 
 `make bench` uses `-m -L`. Each worker registers and seeds one account before
-timing starts. The mixed workload selects among four commands; `-L` keeps the
-session logged in, so PBKDF2 is outside the measured transaction latency.
+timing starts. The mixed workload selects among four commands; with one
+connection, transfer choices become balance reads because there is no recipient.
+`-L` keeps the session logged in, so PBKDF2 is outside the measured
+transaction latency.
 Latency uses `clock_gettime(CLOCK_MONOTONIC)`.
 
-Measured locally on 2 November 2026, with 8-second runs and a 1-second warm-up:
+Measured locally after task 7 on 2 November 2026, with 8-second runs and a
+1-second warm-up. These measurements precede the task 8 username index:
 
 | Machine/CPU | Disk | Connections | Ops/sec | p50 (µs) | p99 (µs) | Avg WAL batch |
 |---|---|---:|---:|---:|---:|---:|
@@ -328,7 +335,8 @@ main thread
 
 On Linux, the accept loop uses `epoll_create1` with `EPOLLIN` on both the listen socket
 and a self-pipe.  The signal handler writes 1 byte to the pipe, which wakes `epoll_wait`
-without races.
+without races. The accepted connection is then served by one worker thread,
+including its command reads and optional TLS handshake.
 
 ### Lock ordering (deadlock-free by design)
 
@@ -363,6 +371,21 @@ Snapshot rows and headers are validated before use; invalid account references
 in replay fail startup. A registry-protected username hash table keeps account
 lookup bounded as the account count grows. Registration derives its password
 hash before acquiring the registry write lock.
+
+### Design trade-offs
+
+- **WAL and snapshots:** the WAL makes an acknowledged write recoverable after
+  a crash; snapshots bound replay time and WAL file growth. A checkpoint
+  excludes in-flight mutations, syncs the snapshot and its directory, then
+  truncates the WAL.
+- **Group commit:** multiple independent mutations can queue while one WAL
+  writer prepares an `fsync()` batch. Each caller still waits for its own
+  record to become durable, so storage latency remains a throughput limit.
+- **Ordered account locks:** transfers acquire both account locks in ascending
+  `account_id` order, so opposite-direction transfers cannot deadlock. The
+  checkpoint lock stays outermost so its snapshot captures applied writes.
+- **Integer paise:** balances use `int64_t` smallest units, giving exact
+  addition and subtraction within checked bounds.
 
 ### Password security
 
@@ -437,7 +460,7 @@ Makefile
 
 ## CI
 
-Two GitHub Actions jobs on every push to `main`:
+Two GitHub Actions jobs on pushes and pull requests to `main`:
 
 **`build-and-test`** (ubuntu-latest):
 - Installs `libssl-dev`, builds server + client + unit + loadgen
