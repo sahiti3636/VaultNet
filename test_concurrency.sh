@@ -8,13 +8,14 @@
 #        Group A (depositors): deposit $OP_AMOUNT into alice.
 #        Group B (transferrers): transfer $OP_AMOUNT from alice to bob.
 #   4. Waits for all background clients to finish.
-#   5. Checks conservation: alice_final + bob_final == initial_total.
+#   5. Checks alice_final + bob_final == initial_total + acknowledged deposits.
 #      (proves no money created or lost under heavy concurrency)
 
 set -uo pipefail
 
 BINDIR="./bin"
 SERVER_BIN="$BINDIR/vaultnet_server"
+RESULT_DIR=$(mktemp -d)
 PORT=18080
 HOST="127.0.0.1"
 SEED_AMOUNT=100000    # each account starts here
@@ -32,7 +33,8 @@ done
 cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    rm -f vaultnet_accounts.dat vaultnet_audit.log
+    rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
+    rm -rf "$RESULT_DIR"
 }
 trap cleanup EXIT
 
@@ -53,7 +55,7 @@ extract_balance() {
 # Kill any stale server from a prior run before we try to bind the port
 pkill -f "vaultnet_server $PORT" 2>/dev/null || true
 sleep 0.2
-rm -f vaultnet_accounts.dat vaultnet_audit.log
+rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
 "$SERVER_BIN" "$PORT" &
 SERVER_PID=$!
 sleep 0.6
@@ -64,9 +66,13 @@ echo "Server started (PID $SERVER_PID, port $PORT)"
 echo "Registering accounts and seeding $SEED_AMOUNT each..."
 
 send_cmds "$(printf 'REGISTER alice alicepass\nQUIT')"      > /dev/null
-send_cmds "$(printf 'REGISTER bob bobpass\nQUIT')"          > /dev/null
-send_cmds "$(printf 'LOGIN alice alicepass\nDEPOSIT %d\nLOGOUT\nQUIT' "$SEED_AMOUNT")" > /dev/null
-send_cmds "$(printf 'LOGIN bob bobpass\nDEPOSIT %d\nLOGOUT\nQUIT'   "$SEED_AMOUNT")"  > /dev/null
+send_cmds "$(printf 'REGISTER bob bobpass8\nQUIT')"          > /dev/null
+SEED_A=$(send_cmds "$(printf 'LOGIN alice alicepass\nDEPOSIT %d\nLOGOUT\nQUIT' "$SEED_AMOUNT")")
+SEED_B=$(send_cmds "$(printf 'LOGIN bob bobpass8\nDEPOSIT %d\nLOGOUT\nQUIT' "$SEED_AMOUNT")")
+if ! grep -q 'OK deposited' <<< "$SEED_A" || ! grep -q 'OK deposited' <<< "$SEED_B"; then
+    echo "FATAL: failed to seed both accounts"
+    exit 1
+fi
 
 sleep 0.3
 
@@ -77,7 +83,8 @@ echo "Spawning $NUM_CLIENTS background clients ($HALF depositors + $HALF transfe
 PIDS=()
 
 for ((i=0; i<HALF; i++)); do
-    send_cmds "$(printf 'LOGIN alice alicepass\nDEPOSIT %d\nLOGOUT\nQUIT' "$OP_AMOUNT")" > /dev/null &
+    (resp=$(send_cmds "$(printf 'LOGIN alice alicepass\nDEPOSIT %d\nLOGOUT\nQUIT' "$OP_AMOUNT")");
+     if grep -q 'OK deposited' <<< "$resp"; then touch "$RESULT_DIR/deposit.$i"; fi) &
     PIDS+=($!)
 done
 
@@ -94,7 +101,7 @@ sleep 0.5   # let any in-flight server writes complete
 
 # ── 4. Query final balances ───────────────────────────────────────────────
 ALICE_RESP=$(send_cmds "$(printf 'LOGIN alice alicepass\nBALANCE\nLOGOUT\nQUIT')")
-BOB_RESP=$(  send_cmds "$(printf 'LOGIN bob bobpass\nBALANCE\nLOGOUT\nQUIT')")
+BOB_RESP=$(  send_cmds "$(printf 'LOGIN bob bobpass8\nBALANCE\nLOGOUT\nQUIT')")
 
 echo ""
 echo "Raw alice response: $ALICE_RESP"
@@ -127,24 +134,26 @@ DEPOSITED=$(( HALF * OP_AMOUNT ))
 # the TOTAL across both accounts = 2*SEED + (count of successful deposits)*OP.
 # We can verify this without knowing how many succeeded: alice+bob >= 2*SEED.
 
-ACTUAL_INT=$(awk "BEGIN{printf \"%d\", $ALICE_BAL + $BOB_BAL + 0.5}")
-BASE=$(( SEED_AMOUNT * 2 ))
-MAX_EXPECTED=$(( BASE + DEPOSITED ))
+to_paise() {
+    local whole="${1%%.*}" frac="${1#*.}"
+    printf '%d' "$((10#$whole * 100 + 10#$frac))"
+}
+ACTUAL_PAISE=$(( $(to_paise "$ALICE_BAL") + $(to_paise "$BOB_BAL") ))
+SUCCESSFUL_DEPOSITS=$(find "$RESULT_DIR" -type f -name 'deposit.*' | wc -l | tr -d ' ')
+EXPECTED_PAISE=$(( (SEED_AMOUNT * 2 + SUCCESSFUL_DEPOSITS * OP_AMOUNT) * 100 ))
 
 echo "──────────────────────────────────────────────────────"
 printf "  alice balance   : %s\n"  "$ALICE_BAL"
 printf "  bob   balance   : %s\n"  "$BOB_BAL"
-printf "  alice + bob     : %d\n"  "$ACTUAL_INT"
-printf "  base (2×seed)   : %d\n"  "$BASE"
-printf "  max possible    : %d  (if all %d deposits succeeded)\n" "$MAX_EXPECTED" "$HALF"
+printf "  alice + bob     : %d paise\n" "$ACTUAL_PAISE"
+printf "  expected        : %d paise\n" "$EXPECTED_PAISE"
+printf "  deposits acked  : %d of %d\n" "$SUCCESSFUL_DEPOSITS" "$HALF"
 echo "──────────────────────────────────────────────────────"
 
-# Conservation: total must be in [BASE, MAX_EXPECTED] and must equal
-# 2*SEED + (some multiple of OP_AMOUNT) since each deposit adds exactly OP_AMOUNT.
-if [[ "$ACTUAL_INT" -ge "$BASE" && "$ACTUAL_INT" -le "$MAX_EXPECTED" ]]; then
-    echo "  RESULT: PASS – money conserved under $NUM_CLIENTS concurrent clients"
+if [[ "$ACTUAL_PAISE" -eq "$EXPECTED_PAISE" ]]; then
+    echo "  RESULT: PASS – money exactly conserved under $NUM_CLIENTS concurrent clients"
 else
-    echo "  RESULT: FAIL – total $ACTUAL_INT is outside [$BASE, $MAX_EXPECTED]!"
+    echo "  RESULT: FAIL – total $ACTUAL_PAISE does not match acknowledged deposits ($EXPECTED_PAISE)!"
     exit 1
 fi
 
