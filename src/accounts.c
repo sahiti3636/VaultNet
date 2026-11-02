@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <time.h>
 
 /* ── global state ─────────────────────────────────────────────────────────── */
 
@@ -47,6 +48,72 @@ static char g_snap_file[256];
 
 /* Op counter for checkpoint triggering */
 static atomic_uint_fast64_t g_op_count = 0;
+static pthread_mutex_t g_ckpt_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ckpt_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_ckpt_tid;
+static int             g_ckpt_started = 0;
+static int             g_ckpt_stop = 0;
+
+static void *checkpoint_worker(void *unused) {
+    (void)unused;
+    uint64_t last_done = 0;
+    pthread_mutex_lock(&g_ckpt_mtx);
+    while (!g_ckpt_stop) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 3;
+        while (!g_ckpt_stop &&
+               atomic_load(&g_op_count) - last_done < WAL_CHECKPOINT_INTERVAL) {
+            if (pthread_cond_timedwait(&g_ckpt_cond, &g_ckpt_mtx,
+                                       &deadline) == ETIMEDOUT) break;
+        }
+        if (g_ckpt_stop) break;
+        uint64_t before = atomic_load(&g_op_count);
+        if (before == last_done) continue;
+        pthread_mutex_unlock(&g_ckpt_mtx);
+
+        /* The checkpoint write lock waits for all WAL+apply readers to finish.
+         * Use the pre-checkpoint count conservatively: later operations may
+         * start just after the lock is released and need another checkpoint. */
+        if (accounts_checkpoint() == 0) last_done = before;
+        else fprintf(stderr, "background checkpoint failed; WAL retained\n");
+
+        pthread_mutex_lock(&g_ckpt_mtx);
+    }
+    pthread_mutex_unlock(&g_ckpt_mtx);
+    return NULL;
+}
+
+int accounts_checkpoint_start(void) {
+    pthread_mutex_lock(&g_ckpt_mtx);
+    if (g_ckpt_started) {
+        pthread_mutex_unlock(&g_ckpt_mtx);
+        return 0;
+    }
+    g_ckpt_stop = 0;
+    if (pthread_create(&g_ckpt_tid, NULL, checkpoint_worker, NULL) != 0) {
+        pthread_mutex_unlock(&g_ckpt_mtx);
+        return -1;
+    }
+    g_ckpt_started = 1;
+    pthread_mutex_unlock(&g_ckpt_mtx);
+    return 0;
+}
+
+void accounts_checkpoint_stop(void) {
+    pthread_mutex_lock(&g_ckpt_mtx);
+    if (!g_ckpt_started) {
+        pthread_mutex_unlock(&g_ckpt_mtx);
+        return;
+    }
+    g_ckpt_stop = 1;
+    pthread_cond_signal(&g_ckpt_cond);
+    pthread_mutex_unlock(&g_ckpt_mtx);
+    pthread_join(g_ckpt_tid, NULL);
+    pthread_mutex_lock(&g_ckpt_mtx);
+    g_ckpt_started = 0;
+    pthread_mutex_unlock(&g_ckpt_mtx);
+}
 
 static void copy_bounded(char *dst, size_t capacity, const char *src) {
     size_t len = strnlen(src, capacity - 1);
@@ -218,6 +285,7 @@ uint64_t accounts_snap_lsn(void) {
 }
 
 void accounts_shutdown(void) {
+    accounts_checkpoint_stop();
     accounts_checkpoint();
 
     pthread_rwlock_wrlock(&g_reg_rwlock);
@@ -233,10 +301,14 @@ void accounts_shutdown(void) {
 
 /* ── checkpoint trigger ───────────────────────────────────────────────────── */
 
-/* Called after the mutation releases the checkpoint read lock. */
+/* The request path only signals; the checkpoint worker does the I/O. */
 static void maybe_checkpoint(void) {
-    if ((atomic_fetch_add(&g_op_count, 1) + 1) % WAL_CHECKPOINT_INTERVAL == 0)
-        accounts_checkpoint();
+    uint64_t count = atomic_fetch_add(&g_op_count, 1) + 1;
+    if (count % WAL_CHECKPOINT_INTERVAL == 0) {
+        pthread_mutex_lock(&g_ckpt_mtx);
+        if (g_ckpt_started) pthread_cond_signal(&g_ckpt_cond);
+        pthread_mutex_unlock(&g_ckpt_mtx);
+    }
 }
 
 /* ── WAL record application (used during replay) ─────────────────────────── */

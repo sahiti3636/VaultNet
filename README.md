@@ -268,7 +268,10 @@ calls, and average batch size on shutdown. In an 8-second local run on an Apple
 M3 Pro with internal SSD, the old lock design had a 1.00 average batch at 64
 connections; the new design measured 1.25. The current benchmark logs in for
 every transaction, so PBKDF2 work still limits throughput (721.0 before and
-675.3 ops/sec after in those runs). These are observations from one run each.
+675.3 ops/sec after in those runs). With checkpoints moved to a background
+worker, a repeat at 64 connections measured 702.2 ops/sec and a maximum
+latency of 259,992 µs versus 332,613 µs with request-path checkpoints.
+These are observations from one run each.
 
 ---
 
@@ -308,8 +311,10 @@ Every successful balance mutation follows this sequence:
 2. The WAL writer writes and `fsync()`s the record. It can batch records already
    queued together.
 3. Apply the new balance in memory and acknowledge the command.
-4. Every 500 mutations and on clean shutdown, write and sync a text snapshot,
-   atomically rename it, sync its directory, then truncate the WAL.
+4. A background worker wakes after 500 mutations or every 3 seconds, writes
+   and syncs a text snapshot, atomically renames it, syncs its directory, then
+   truncates the WAL. Requests only signal it. Shutdown stops the worker and
+   takes one final checkpoint.
 
 On startup, the server replays any WAL records whose LSN exceeds the snapshot's
 checkpoint LSN, restoring all acknowledged operations after a crash.

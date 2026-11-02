@@ -41,6 +41,7 @@ static void init_fresh(void) {
     accounts_init(SNAP);
     wal_replay(WAL, accounts_snap_lsn());
     wal_init(WAL);
+    accounts_checkpoint_start();
 }
 
 static void shutdown_clean(void) {
@@ -50,6 +51,7 @@ static void shutdown_clean(void) {
 
 /* "crash" shutdown: flush WAL records to disk but skip the checkpoint */
 static void shutdown_crash(void) {
+    accounts_checkpoint_stop();
     wal_shutdown();        /* fsyncs WAL but does NOT write snapshot */
     /* accounts_shutdown() NOT called: no checkpoint */
 }
@@ -58,6 +60,7 @@ static void reinit_after_crash(void) {
     accounts_init(SNAP);
     wal_replay(WAL, accounts_snap_lsn());
     wal_init(WAL);
+    accounts_checkpoint_start();
 }
 
 /* ── test suites ──────────────────────────────────────────────────────────── */

@@ -514,6 +514,10 @@ int main(int argc, char *argv[]) {
 
     g_listen_fd = make_listen_socket(port);
     if (g_listen_fd < 0) return 1;
+    if (accounts_checkpoint_start() < 0) {
+        fprintf(stderr, "Failed to start checkpoint worker\n");
+        return 1;
+    }
 
     fprintf(stdout, "VaultNet server listening on port %d  "
                     "(pool=%d threads, queue=%d jobs%s)\n",

@@ -56,6 +56,12 @@ uint64_t accounts_snap_lsn(void);
  */
 int  accounts_checkpoint(void);
 
+/* Start after wal_init; the worker checkpoints every 500 ops or 3 seconds. */
+int  accounts_checkpoint_start(void);
+
+/* Stop without a final checkpoint (used by the in-process crash test). */
+void accounts_checkpoint_stop(void);
+
 /* Call at shutdown: final persist + destroy per-account mutexes. */
 void accounts_shutdown(void);
 
