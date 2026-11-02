@@ -207,7 +207,8 @@ int wal_append(WALType type,
         return -1;
     }
 
-    uint64_t lsn  = atomic_fetch_add(&g_last_lsn, 1) + 1;
+    uint64_t lsn  = atomic_fetch_add_explicit(&g_last_lsn, 1,
+                                               memory_order_relaxed) + 1;
     WALSlot request = {0};
     g_q[g_prod & (WAL_QSIZE - 1)] = &request;
     build_record(&request.rec, type, account_id, username1, username2,
@@ -236,7 +237,7 @@ int wal_truncate(void) {
 }
 
 uint64_t wal_last_lsn(void) {
-    return g_last_lsn;
+    return atomic_load_explicit(&g_last_lsn, memory_order_acquire);
 }
 
 /* ── Replay (single-threaded startup) ───────────────────────────────────────
@@ -245,7 +246,7 @@ uint64_t wal_last_lsn(void) {
  * record whose lsn > from_lsn.  Stops at the first bad magic/CRC.
  */
 int wal_replay(const char *wal_path, uint64_t from_lsn) {
-    atomic_store(&g_last_lsn, from_lsn);
+    atomic_store_explicit(&g_last_lsn, from_lsn, memory_order_release);
     int fd = open(wal_path, O_RDWR);
     if (fd < 0) {
         if (errno == ENOENT) return 0;  /* no WAL yet, that's fine */
@@ -289,9 +290,13 @@ int wal_replay(const char *wal_path, uint64_t from_lsn) {
         if (r.lsn <= from_lsn) { skipped++; continue; }
 
         accounts_apply_wal_record(&r);
-        uint64_t prev = atomic_load(&g_last_lsn);
-    while (r.lsn > prev &&
-           !atomic_compare_exchange_weak(&g_last_lsn, &prev, r.lsn)) {}
+        uint64_t prev = atomic_load_explicit(&g_last_lsn,
+                                              memory_order_relaxed);
+        while (r.lsn > prev &&
+               !atomic_compare_exchange_weak_explicit(&g_last_lsn, &prev,
+                                                       r.lsn,
+                                                       memory_order_release,
+                                                       memory_order_relaxed)) {}
 
         replayed++;
     }
