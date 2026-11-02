@@ -262,10 +262,13 @@ Latency  p99       : 41281 µs
 Latency  max       : 56010 µs
 ```
 
-Each acknowledged write waits for a WAL `fsync()`. The global account write mutex
-currently serializes balance mutations, so the WAL writer rarely has multiple
-account records to batch. The benchmark is a local observation, not a throughput
-guarantee.
+Each acknowledged write waits for a WAL `fsync()`. Independent account mutations
+can now queue records concurrently, and the WAL writer reports records, `fsync`
+calls, and average batch size on shutdown. In an 8-second local run on an Apple
+M3 Pro with internal SSD, the old lock design had a 1.00 average batch at 64
+connections; the new design measured 1.25. The current benchmark logs in for
+every transaction, so PBKDF2 work still limits throughput (721.0 before and
+675.3 ops/sec after in those runs). These are observations from one run each.
 
 ---
 
@@ -286,14 +289,16 @@ without races.
 
 ### Lock ordering (deadlock-free by design)
 
-Three lock levels, always acquired in ascending order; never in reverse:
+Mutating operations acquire locks in this order:
 
-1. **`g_reg_rwlock`** (`pthread_rwlock_t`) — write-locked only for `REGISTER`;
-   read-locked for all other authenticated operations.
-2. **`g_file_mtx`** (`pthread_mutex_t`) — serialises WAL and snapshot writes.
-3. **`account.lock`** (per-account `pthread_mutex_t`) — protects `balance`.
+1. **`g_ckpt_rwlock`** in read mode — prevents a checkpoint from observing a
+   WAL record before its balance is applied.
+2. **`g_reg_rwlock`** — write-locked for `REGISTER`, read-locked for other
+   mutations.
+3. **`account.lock`** — protects each balance.
    For `TRANSFER`, both account locks are acquired in ascending `account_id` order
-   to prevent a cycle in the lock graph.
+   to prevent a cycle in the lock graph. A checkpoint takes `g_ckpt_rwlock` in
+   write mode after in-flight mutations finish.
 
 ### WAL and crash recovery
 
@@ -389,8 +394,8 @@ Two GitHub Actions jobs on every push to `main`:
 ## Limitations and Known Trade-offs
 
 - **Single WAL file**: suitable for a single-node server; no replication.
-- **fsync bottleneck**: throughput is bound by disk write latency under group commit.
-  An in-memory mode (skip WAL writes) would be orders of magnitude faster but loses durability.
+- **fsync bottleneck**: each acknowledged mutation waits for WAL durability;
+  batching reduces the number of syncs when independent operations overlap.
 - **TLS peer verification disabled on client**: `tls_client_ctx(0)` uses `SSL_VERIFY_NONE`
   — appropriate for a dev certificate; production use should verify the server's cert chain.
 - **Max accounts**: compile-time constant `MAX_ACCOUNTS` (default 2048) in `protocol.h`.

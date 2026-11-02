@@ -74,6 +74,9 @@ static pthread_cond_t    g_flush = PTHREAD_COND_INITIALIZER; /* writer → prod 
 static int                  g_wal_fd = -1;
 static _Atomic uint64_t     g_last_lsn = 0;
 static pthread_t            g_writer_tid;
+/* Only the writer thread updates these; shutdown reads them after pthread_join. */
+static uint64_t             g_records_written = 0;
+static uint64_t             g_fsync_calls = 0;
 
 static void copy_bounded(char *dst, size_t capacity, const char *src) {
     size_t len = strnlen(src, capacity - 1);
@@ -139,8 +142,11 @@ static void *writer_thread(void *arg) {
                     (ssize_t)sizeof(WALRecord))
                 ok = 0;
         }
-        if (ok && fsync(g_wal_fd) < 0)
-            ok = 0;
+        if (ok) {
+            g_fsync_calls++;
+            if (fsync(g_wal_fd) < 0) ok = 0;
+        }
+        if (ok) g_records_written += n;
 
         /* Mark all slots in this batch as done */
         pthread_mutex_lock(&g_qmtx);
@@ -170,6 +176,8 @@ int wal_init(const char *wal_path) {
     g_prod = g_cons = 0;
     g_shutdown = 0;
     g_io_failed = 0;
+    g_records_written = 0;
+    g_fsync_calls = 0;
     if (pthread_create(&g_writer_tid, NULL, writer_thread, NULL) != 0) {
         close(g_wal_fd);
         g_wal_fd = -1;
@@ -184,6 +192,9 @@ void wal_shutdown(void) {
     pthread_cond_signal(&g_work);
     pthread_mutex_unlock(&g_qmtx);
     pthread_join(g_writer_tid, NULL);
+    fprintf(stderr, "WAL stats: records=%" PRIu64 " fsyncs=%" PRIu64
+            " avg_batch=%.2f\n", g_records_written, g_fsync_calls,
+            g_fsync_calls ? (double)g_records_written / (double)g_fsync_calls : 0.0);
     if (g_wal_fd >= 0) {
         fsync(g_wal_fd);
         close(g_wal_fd);

@@ -7,20 +7,18 @@
 #include <stdint.h>
 
 /*
- * Locking design (Phase 1 revision):
+ * Locking design:
  *
  * Every mutating operation follows this ordering (never reversed):
- *   g_reg_rwlock(W or R) → g_file_mtx → account.lock(s, ascending account_id)
+ *   g_ckpt_rwlock(R) → g_reg_rwlock(W or R) → account.lock(s, ascending id)
  *
  * Read-only operations use:
- *   g_reg_rwlock(R) → account.lock    (no g_file_mtx needed)
+ *   g_reg_rwlock(R) → account.lock
  *
- * Acquiring g_file_mtx BEFORE account locks is the key invariant: while we
- * hold g_file_mtx, no other thread can be modifying any balance (they block
- * waiting for g_file_mtx before touching the balance field).  This means
- * persist_accounts_locked can snapshot every account without per-account
- * locks, eliminating the data race that existed when g_file_mtx was acquired
- * last (after the balance had already been modified).
+ * The checkpoint takes g_ckpt_rwlock(W), excluding every in-flight mutation
+ * until its WAL record is durable and its new balance is applied. The snapshot
+ * can then read all balances without per-account locks. Independent accounts
+ * can append concurrently, allowing WAL group commit to batch fsyncs.
  *
  * Transfers lock both accounts in ascending account_id order to prevent
  * deadlock (classic two-resource ordering).
@@ -52,7 +50,7 @@ uint64_t accounts_snap_lsn(void);
 
 /*
  * Write a snapshot of all accounts to disk (atomic rename), then call
- * wal_truncate() to empty the WAL.  Caller MUST hold g_file_mtx.
+ * wal_truncate() to empty the WAL. Acquires g_ckpt_rwlock(W) internally.
  * This is also called by accounts_shutdown().
  * Returns 0 on success, -1 on error.
  */

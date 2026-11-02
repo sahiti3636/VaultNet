@@ -11,8 +11,10 @@
  *   checkpoints (every WAL_CHECKPOINT_INTERVAL ops or on clean shutdown).
  *   Recovery: load snapshot → replay WAL records with lsn > snap_lsn.
  *
- * Lock ordering (unchanged from Phase 1):
- *   g_reg_rwlock(W or R) → g_file_mtx → account.lock(s, ascending id)
+ * Lock ordering:
+ *   g_ckpt_rwlock(R) → g_reg_rwlock(W or R) → account.lock(s, ascending id)
+ * A checkpoint takes g_ckpt_rwlock(W) after each mutation has both reached
+ * durable WAL and applied its new balance, so its snapshot is a clean prefix.
  */
 
 #include "accounts.h"
@@ -39,7 +41,7 @@ static uint64_t         g_next_id      = 1;
 static uint64_t         g_snap_lsn     = 0;  /* LSN at time of last snapshot */
 
 static pthread_rwlock_t g_reg_rwlock = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_mutex_t  g_file_mtx   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t g_ckpt_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
 static char g_snap_file[256];
 
@@ -95,9 +97,9 @@ static Account *find_by_id_unlocked(uint64_t id) {
 
 /*
  * Write all active accounts to SNAP_FILE_TMP, fsync, rename to g_snap_file,
- * then truncate the WAL.  Caller MUST hold g_file_mtx.
+ * then truncate the WAL. Caller holds the checkpoint write lock.
  */
-int accounts_checkpoint(void) {
+static int checkpoint_locked(void) {
     char tmp[280];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_snap_file);
 
@@ -132,6 +134,13 @@ int accounts_checkpoint(void) {
 
     g_snap_lsn = snap_lsn;
     return wal_truncate();
+}
+
+int accounts_checkpoint(void) {
+    pthread_rwlock_wrlock(&g_ckpt_rwlock);
+    int rc = checkpoint_locked();
+    pthread_rwlock_unlock(&g_ckpt_rwlock);
+    return rc;
 }
 
 static int load_snapshot(void) {
@@ -209,9 +218,7 @@ uint64_t accounts_snap_lsn(void) {
 }
 
 void accounts_shutdown(void) {
-    pthread_mutex_lock(&g_file_mtx);
     accounts_checkpoint();
-    pthread_mutex_unlock(&g_file_mtx);
 
     pthread_rwlock_wrlock(&g_reg_rwlock);
     for (int i = 0; i < g_num_accounts; i++) {
@@ -226,7 +233,7 @@ void accounts_shutdown(void) {
 
 /* ── checkpoint trigger ───────────────────────────────────────────────────── */
 
-/* Called after each wal_append (with g_file_mtx and relevant locks still held). */
+/* Called after the mutation releases the checkpoint read lock. */
 static void maybe_checkpoint(void) {
     if ((atomic_fetch_add(&g_op_count, 1) + 1) % WAL_CHECKPOINT_INTERVAL == 0)
         accounts_checkpoint();
@@ -276,17 +283,20 @@ void accounts_apply_wal_record(const WALRecord *r) {
 /* ── public operations ────────────────────────────────────────────────────── */
 
 int accounts_register(const char *username, const char *password) {
+    pthread_rwlock_rdlock(&g_ckpt_rwlock);
     pthread_rwlock_wrlock(&g_reg_rwlock);
 
     for (int i = 0; i < g_num_accounts; i++) {
         if (g_accounts[i].active &&
             strncmp(g_accounts[i].username, username, MAX_USERNAME) == 0) {
             pthread_rwlock_unlock(&g_reg_rwlock);
+            pthread_rwlock_unlock(&g_ckpt_rwlock);
             return -1;
         }
     }
     if (g_num_accounts >= MAX_ACCOUNTS) {
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
     }
 
@@ -298,12 +308,12 @@ int accounts_register(const char *username, const char *password) {
         hash_password(password, a->salt, a->password_hash,
                       sizeof(a->password_hash)) != 0) {
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
     }
     a->balance_paise = 0;
     pthread_mutex_init(&a->lock, NULL);
 
-    pthread_mutex_lock(&g_file_mtx);
     int rc = wal_append(WAL_REGISTER, a->account_id,
                         a->username, NULL,
                         a->password_hash, a->salt,
@@ -312,14 +322,13 @@ int accounts_register(const char *username, const char *password) {
         a->active = 1;
         g_num_accounts++;
         g_next_id++;
-        maybe_checkpoint();
     } else {
         pthread_mutex_destroy(&a->lock);
         memset(a, 0, sizeof(*a));
     }
-    pthread_mutex_unlock(&g_file_mtx);
-
     pthread_rwlock_unlock(&g_reg_rwlock);
+    pthread_rwlock_unlock(&g_ckpt_rwlock);
+    if (rc == 0) maybe_checkpoint();
     return rc;
 }
 
@@ -352,13 +361,13 @@ int accounts_get_balance(const char *username, int64_t *bal_out) {
 int accounts_deposit(const char *username, int64_t paise, int64_t *bal_out) {
     if (paise <= 0) return -1;
 
+    pthread_rwlock_rdlock(&g_ckpt_rwlock);
     pthread_rwlock_rdlock(&g_reg_rwlock);
-    pthread_mutex_lock(&g_file_mtx);
 
     Account *a = find_account_unlocked(username);
     if (!a) {
-        pthread_mutex_unlock(&g_file_mtx);
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
     }
 
@@ -366,8 +375,8 @@ int accounts_deposit(const char *username, int64_t paise, int64_t *bal_out) {
     if (paise > INT64_MAX - a->balance_paise) {
         *bal_out = a->balance_paise;
         pthread_mutex_unlock(&a->lock);
-        pthread_mutex_unlock(&g_file_mtx);
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
     }
     int64_t next_balance = a->balance_paise + paise;
@@ -376,26 +385,26 @@ int accounts_deposit(const char *username, int64_t paise, int64_t *bal_out) {
                         paise, next_balance, 0);
     if (rc == 0) {
         a->balance_paise = next_balance;
-        maybe_checkpoint();
     }
     *bal_out = a->balance_paise;
     pthread_mutex_unlock(&a->lock);
 
-    pthread_mutex_unlock(&g_file_mtx);
     pthread_rwlock_unlock(&g_reg_rwlock);
+    pthread_rwlock_unlock(&g_ckpt_rwlock);
+    if (rc == 0) maybe_checkpoint();
     return rc;
 }
 
 int accounts_withdraw(const char *username, int64_t paise, int64_t *bal_out) {
     if (paise <= 0) return -1;
 
+    pthread_rwlock_rdlock(&g_ckpt_rwlock);
     pthread_rwlock_rdlock(&g_reg_rwlock);
-    pthread_mutex_lock(&g_file_mtx);
 
     Account *a = find_account_unlocked(username);
     if (!a) {
-        pthread_mutex_unlock(&g_file_mtx);
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         *bal_out = 0;
         return -1;
     }
@@ -404,8 +413,8 @@ int accounts_withdraw(const char *username, int64_t paise, int64_t *bal_out) {
     *bal_out = a->balance_paise;
     if (a->balance_paise < paise) {
         pthread_mutex_unlock(&a->lock);
-        pthread_mutex_unlock(&g_file_mtx);
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
     }
     int64_t next_balance = a->balance_paise - paise;
@@ -414,13 +423,13 @@ int accounts_withdraw(const char *username, int64_t paise, int64_t *bal_out) {
                         paise, next_balance, 0);
     if (rc == 0) {
         a->balance_paise = next_balance;
-        maybe_checkpoint();
     }
     *bal_out = a->balance_paise;
     pthread_mutex_unlock(&a->lock);
 
-    pthread_mutex_unlock(&g_file_mtx);
     pthread_rwlock_unlock(&g_reg_rwlock);
+    pthread_rwlock_unlock(&g_ckpt_rwlock);
+    if (rc == 0) maybe_checkpoint();
     return rc;
 }
 
@@ -428,15 +437,15 @@ int accounts_transfer(const char *src_user, const char *dst_user,
                       int64_t paise, int64_t *src_bal_out) {
     if (paise <= 0) return -1;
 
+    pthread_rwlock_rdlock(&g_ckpt_rwlock);
     pthread_rwlock_rdlock(&g_reg_rwlock);
-    pthread_mutex_lock(&g_file_mtx);
 
     Account *src = find_account_unlocked(src_user);
     Account *dst = find_account_unlocked(dst_user);
 
     if (!src || !dst || src == dst) {
-        pthread_mutex_unlock(&g_file_mtx);
         pthread_rwlock_unlock(&g_reg_rwlock);
+        pthread_rwlock_unlock(&g_ckpt_rwlock);
         if (src_bal_out) *src_bal_out = 0;
         return -1;
     }
@@ -459,14 +468,14 @@ int accounts_transfer(const char *src_user, const char *dst_user,
         if (rc == 0) {
             src->balance_paise = next_src;
             dst->balance_paise = next_dst;
-            maybe_checkpoint();
         }
         *src_bal_out = src->balance_paise;
     }
 
     pthread_mutex_unlock(&second->lock);
     pthread_mutex_unlock(&first->lock);
-    pthread_mutex_unlock(&g_file_mtx);
     pthread_rwlock_unlock(&g_reg_rwlock);
+    pthread_rwlock_unlock(&g_ckpt_rwlock);
+    if (rc == 0) maybe_checkpoint();
     return rc;
 }
