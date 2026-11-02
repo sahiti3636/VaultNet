@@ -2,27 +2,30 @@
 #define ACCOUNTS_H
 
 #include "protocol.h"
+#include "wal.h"
 #include <pthread.h>
 #include <stdint.h>
 
 /*
- * Locking design (see accounts.c for details):
+ * Locking design (Phase 1 revision):
  *
- *  1. g_reg_rwlock  – reader-writer lock protecting the accounts[] array
- *     and num_accounts count.  Taken as WRITE for REGISTER; READ for all
- *     other operations that look up an existing account.
+ * Every mutating operation follows this ordering (never reversed):
+ *   g_reg_rwlock(W or R) → g_file_mtx → account.lock(s, ascending account_id)
  *
- *  2. Account.lock  – per-account mutex protecting balance and state fields.
- *     For single-account ops: take g_reg_rwlock(READ) → take account.lock.
- *     For transfers: take g_reg_rwlock(READ) → take BOTH account locks in
- *     ascending account_id order to prevent deadlock.
+ * Read-only operations use:
+ *   g_reg_rwlock(R) → account.lock    (no g_file_mtx needed)
  *
- *  3. g_file_mtx    – mutex serializing writes to the accounts data file.
- *     Taken AFTER account lock(s) are held (never the reverse).
- *     fcntl F_SETLKW is applied inside for OS-level exclusion as well.
+ * Acquiring g_file_mtx BEFORE account locks is the key invariant: while we
+ * hold g_file_mtx, no other thread can be modifying any balance (they block
+ * waiting for g_file_mtx before touching the balance field).  This means
+ * persist_accounts_locked can snapshot every account without per-account
+ * locks, eliminating the data race that existed when g_file_mtx was acquired
+ * last (after the balance had already been modified).
  *
- * Lock ordering (must never reverse):
- *   g_reg_rwlock(W or R) → account.lock (low id first) → g_file_mtx
+ * Transfers lock both accounts in ascending account_id order to prevent
+ * deadlock (classic two-resource ordering).
+ *
+ * All public operations manage their own locks.  Callers never touch locks.
  */
 
 typedef struct {
@@ -30,71 +33,83 @@ typedef struct {
     char            username[MAX_USERNAME];
     char            password_hash[MAX_HASH];
     char            salt[SALT_HEX_LEN];
-    double          balance;
-    int             active;        /* 1 = valid slot */
-    pthread_mutex_t lock;          /* per-account balance lock */
+    int64_t         balance_paise;   /* balance in smallest currency unit */
+    int             active;
+    pthread_mutex_t lock;
 } Account;
 
 /* ---------- lifecycle ---------- */
 
-/* Call once at startup. Returns 0 on success, -1 on error. */
-int  accounts_init(const char *data_file);
+/*
+ * Call once at startup.  Loads the snapshot from snap_file; stores the
+ * snapshot LSN internally (retrieve with accounts_snap_lsn()).
+ * Returns 0 on success, -1 on error.
+ */
+int  accounts_init(const char *snap_file);
 
-/* Call at shutdown to flush and free. */
+/* Returns the snapshot LSN loaded by accounts_init (0 if no snapshot). */
+uint64_t accounts_snap_lsn(void);
+
+/*
+ * Write a snapshot of all accounts to disk (atomic rename), then call
+ * wal_truncate() to empty the WAL.  Caller MUST hold g_file_mtx.
+ * This is also called by accounts_shutdown().
+ * Returns 0 on success, -1 on error.
+ */
+int  accounts_checkpoint(void);
+
+/* Call at shutdown: final persist + destroy per-account mutexes. */
 void accounts_shutdown(void);
 
-/* ---------- lookup ---------- */
+/* ---------- operations (all locking handled internally) ---------- */
 
 /*
- * Find an active account by username.
- * Returns a LOCKED Account* (caller must unlock via accounts_unlock), or NULL.
- * Caller must hold g_reg_rwlock(READ) via accounts_rdlock/accounts_rdunlock.
- */
-Account *accounts_find_locked(const char *username);
-
-/* Release an account lock acquired via accounts_find_locked. */
-void accounts_unlock(Account *a);
-
-/* Convenience: take the registry read-lock. */
-void accounts_rdlock(void);
-void accounts_rdunlock(void);
-
-/* ---------- operations ---------- */
-
-/*
- * Register a new account.  Returns 0 on success, -1 if username taken or
- * account limit reached.  Persists immediately.
+ * Create a new account.
+ * Returns 0 on success, -1 if username is taken or account limit reached.
  */
 int accounts_register(const char *username, const char *password);
 
 /*
- * Verify credentials.  Returns 1 on match, 0 on failure.
- * Does NOT require the registry lock to be held by the caller.
+ * Check credentials.
+ * Returns 1 on match, 0 on failure.
  */
 int accounts_authenticate(const char *username, const char *password);
 
 /*
- * Balance query.  Caller must hold g_reg_rwlock(READ) and account.lock.
+ * Read current balance.
+ * Returns 0 on success and writes balance (paise) to *bal_out;
+ * returns -1 if account not found.
  */
-double accounts_balance(Account *a);
+int accounts_get_balance(const char *username, int64_t *bal_out);
 
 /*
- * Deposit amount into account.  Caller must hold g_reg_rwlock(READ) and
- * account.lock.  Persists the change.  Returns 0 on success, -1 on error.
+ * Deposit paise into account.
+ * Returns 0 on success; -1 on invalid amount or unknown account.
+ * *bal_out receives the new balance.
  */
-int accounts_deposit(Account *a, double amount);
+int accounts_deposit(const char *username, int64_t paise, int64_t *bal_out);
 
 /*
- * Withdraw amount from account.  Returns 0 on success, -1 if insufficient
- * funds or invalid amount.  Caller must hold rdlock + account.lock.
+ * Withdraw paise from account.
+ * Returns 0 on success; -1 on insufficient funds, invalid amount, or
+ * unknown account.  *bal_out is always set to the current balance (useful
+ * for error messages even on failure).
  */
-int accounts_withdraw(Account *a, double amount);
+int accounts_withdraw(const char *username, int64_t paise, int64_t *bal_out);
 
 /*
- * Transfer amount from `src` to `dst`.  Both accounts must NOT be locked
- * by the caller — this function acquires them in the correct order.
- * Caller must hold g_reg_rwlock(READ).  Returns 0 on success, -1 on error.
+ * Transfer paise from src_user to dst_user atomically.
+ * Returns 0 on success; -1 on insufficient funds, unknown account, or
+ * src==dst.  *src_bal_out is set to src's balance at the point of failure
+ * (or the new balance on success).
  */
-int accounts_transfer(Account *src, Account *dst, double amount);
+int accounts_transfer(const char *src_user, const char *dst_user,
+                      int64_t paise, int64_t *src_bal_out);
+
+/*
+ * Apply a single WAL record to the in-memory account store.
+ * Called by wal_replay() during single-threaded startup; no locking needed.
+ */
+void accounts_apply_wal_record(const WALRecord *r);
 
 #endif /* ACCOUNTS_H */

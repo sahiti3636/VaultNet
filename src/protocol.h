@@ -2,17 +2,21 @@
 #define PROTOCOL_H
 
 /* Line-based text protocol constants */
-
 #define PROTO_OK  "OK"
 #define PROTO_ERR "ERR"
 
-/* Maximum lengths */
-#define MAX_USERNAME   64
+/* Buffer sizes (always larger than the corresponding content limits) */
+#define MAX_USERNAME   64    /* buffer; content validated to MAX_USERNAME_LEN */
 #define MAX_PASSWORD   128
 #define MAX_LINE       512
 #define MAX_HASH       129   /* 128 hex chars + NUL */
 #define SALT_LEN       16    /* bytes of random salt */
-#define SALT_HEX_LEN   33    /* hex-encoded salt + NUL */
+#define SALT_HEX_LEN   33    /* hex-encoded + NUL */
+
+/* Content-length limits for validation */
+#define MIN_USERNAME_LEN  3
+#define MAX_USERNAME_LEN  32
+#define MIN_PASSWORD_LEN  8
 
 /* Thread pool / queue sizing */
 #define THREADPOOL_SIZE   64
@@ -26,8 +30,21 @@
 #define DEFAULT_PORT      8080
 #define BACKLOG           128
 
+/* Per-connection idle timeout (SO_RCVTIMEO), seconds */
+#define CONN_IDLE_TIMEOUT_SEC  60
+
+/* Max failed LOGIN attempts before the connection is closed */
+#define MAX_FAILED_LOGINS  5
+
 /* Persistence files */
-#define ACCOUNTS_FILE  "vaultnet_accounts.dat"
+#define SNAP_FILE      "vaultnet.snap"       /* account snapshot (text)   */
+#define SNAP_FILE_TMP  "vaultnet.snap.tmp"   /* atomic-write temp         */
+#define WAL_FILE       "vaultnet.wal"        /* write-ahead log (binary)  */
 #define AUDIT_FILE     "vaultnet_audit.log"
+/* Exclusive lock file — prevents two server instances sharing one data dir */
+#define LOCK_FILE      "vaultnet.lock"
+
+/* WAL tuning */
+#define WAL_CHECKPOINT_INTERVAL  500   /* checkpoint every N appended records */
 
 #endif /* PROTOCOL_H */
