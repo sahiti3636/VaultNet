@@ -179,6 +179,16 @@ static void handle_client(void *arg) {
     ClientConn *conn = (ClientConn *)arg;
     VNConn     *c    = &conn->c;
 
+    if (g_ssl_ctx) {
+        c->ssl = SSL_new(g_ssl_ctx);
+        if (!c->ssl || SSL_set_fd(c->ssl, c->fd) != 1 ||
+            SSL_accept(c->ssl) <= 0) {
+            vn_close(c);
+            free(conn);
+            return;
+        }
+    }
+
     char session_user[MAX_USERNAME];
     memset(session_user, 0, sizeof(session_user));
     int logged_in     = 0;
@@ -421,48 +431,37 @@ static int make_listen_socket(int port) {
     return fd;
 }
 
-/* Accept one connection, optionally do TLS handshake, hand off to pool. */
-static void accept_and_dispatch(void) {
+/* Accept one connection and hand off to the pool. Returns 1 when accepted. */
+static int accept_and_dispatch(void) {
     struct sockaddr_in ca;
     socklen_t cal = sizeof(ca);
     int cfd = accept(g_listen_fd, (struct sockaddr *)&ca, &cal);
     if (cfd < 0) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
             if (errno != EBADF) perror("accept");
-        return;
+        return 0;
     }
 
     struct timeval tv = { .tv_sec = CONN_IDLE_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    SSL *ssl = NULL;
-    if (g_ssl_ctx) {
-        ssl = SSL_new(g_ssl_ctx);
-        SSL_set_fd(ssl, cfd);
-        if (SSL_accept(ssl) <= 0) {
-            ERR_print_errors_fp(stderr);
-            SSL_free(ssl);
-            close(cfd);
-            return;
-        }
-    }
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     ClientConn *conn = malloc(sizeof(ClientConn));
     if (!conn) {
         fprintf(stderr, "malloc failed\n");
-        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
         close(cfd);
-        return;
+        return 1;
     }
     conn->c.fd  = cfd;
-    conn->c.ssl = ssl;
+    conn->c.ssl = NULL;
     inet_ntop(AF_INET, &ca.sin_addr, conn->peer_addr, sizeof(conn->peer_addr));
 
     if (threadpool_submit(&g_pool, handle_client, conn) < 0) {
-        vn_sendline(&conn->c, "ERR server busy, try again");
+        if (!g_ssl_ctx) vn_sendline(&conn->c, "ERR server busy, try again");
         vn_close(&conn->c);
         free(conn);
     }
+    return 1;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
@@ -522,6 +521,11 @@ int main(int argc, char *argv[]) {
 #ifdef __linux__
     /* ── epoll accept loop (Linux) ────────────────────────────────────────── */
     {
+        if (fcntl(g_listen_fd, F_SETFL,
+                  fcntl(g_listen_fd, F_GETFL) | O_NONBLOCK) < 0) {
+            perror("listen: nonblock");
+            return 1;
+        }
         if (pipe(g_pipe) < 0) { perror("pipe"); return 1; }
         fcntl(g_pipe[1], F_SETFL, fcntl(g_pipe[1], F_GETFL) | O_NONBLOCK);
 
@@ -545,7 +549,8 @@ int main(int argc, char *argv[]) {
             }
             for (int i = 0; i < n && !done; i++) {
                 if (events[i].data.fd == g_pipe[0])  { done = 1; break; }
-                if (events[i].data.fd == g_listen_fd) accept_and_dispatch();
+                if (events[i].data.fd == g_listen_fd)
+                    while (g_running && accept_and_dispatch()) {}
             }
         }
         close(ep);
