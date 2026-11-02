@@ -8,16 +8,17 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <stdint.h>
 #include <errno.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 
-#define AUDIT_LINE_MAX 512
-#define HISTORY_SCAN_MAX 100000  /* scan at most this many lines */
+#define AUDIT_LINE_MAX  512
+#define HISTORY_SCAN_MAX 100000
 
 static FILE            *g_log_fp  = NULL;
 static pthread_mutex_t  g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t         g_seq     = 0;
+static _Atomic uint64_t g_seq     = 0;
 
 static void iso8601_now(char *buf, size_t len) {
     time_t t = time(NULL);
@@ -34,8 +35,7 @@ int audit_init(const char *log_path) {
         pthread_mutex_unlock(&g_log_mtx);
         return -1;
     }
-    /* Disable buffering so each write reaches the OS immediately */
-    setvbuf(g_log_fp, NULL, _IOLBF, 0);
+    setvbuf(g_log_fp, NULL, _IOLBF, 0);  /* line-buffered: flush on each '\n' */
     pthread_mutex_unlock(&g_log_mtx);
     return 0;
 }
@@ -51,35 +51,35 @@ void audit_close(void) {
 }
 
 void audit_log(const char *event, const char *username,
-               const char *detail, double amount,
+               const char *detail, int64_t amount_paise,
                const char *result) {
     char ts[32];
     iso8601_now(ts, sizeof(ts));
 
+    /* Format amount as "rupees.paise" for human readability */
+    uint64_t ap = amount_paise < 0
+                    ? (uint64_t)(-(amount_paise + 1)) + 1
+                    : (uint64_t)amount_paise;
+    const char *sign = (amount_paise < 0) ? "-" : "";
+
     pthread_mutex_lock(&g_log_mtx);
-    uint64_t seq = ++g_seq;
+    uint64_t seq = atomic_fetch_add(&g_seq, 1) + 1;
     if (g_log_fp) {
-        fprintf(g_log_fp, "%llu|%s|%s|%s|%s|%.2f|%s\n",
-                (unsigned long long)seq,
-                ts,
+        fprintf(g_log_fp,
+                "%" PRIu64 "|%s|%s|%s|%s|%s%" PRIu64 ".%02" PRIu64 "|%s\n",
+                seq, ts,
                 event    ? event    : "",
                 username ? username : "",
                 detail   ? detail   : "",
-                amount,
+                sign, ap / 100, ap % 100,
                 result   ? result   : "");
     }
     pthread_mutex_unlock(&g_log_mtx);
 }
 
-/*
- * Collect up to `n` matching lines by scanning the entire log file.
- * We store pointers to matching lines in a ring buffer and then emit
- * the most recent `n` of them.
- */
 int audit_history(const char *username, int n, int fd) {
     if (!g_log_fp || n <= 0) return 0;
 
-    /* Snapshot the current log path by re-opening for reading */
     pthread_mutex_lock(&g_log_mtx);
     fflush(g_log_fp);
     pthread_mutex_unlock(&g_log_mtx);
@@ -87,7 +87,6 @@ int audit_history(const char *username, int n, int fd) {
     FILE *rfp = fopen(AUDIT_FILE, "r");
     if (!rfp) return 0;
 
-    /* Ring buffer of matched lines (heap-allocated to avoid large stack) */
     char **ring = calloc((size_t)n, sizeof(char *));
     if (!ring) { fclose(rfp); return 0; }
 
@@ -95,21 +94,18 @@ int audit_history(const char *username, int n, int fd) {
     char linebuf[AUDIT_LINE_MAX];
 
     while (scanned++ < HISTORY_SCAN_MAX && fgets(linebuf, sizeof(linebuf), rfp)) {
-        /* Format: seq|ts|EVENT|username|detail|amount|result */
-        /* We match on the username field (field index 3, 0-based) */
-        char *fields[7];
+        /* Field 3 (0-based) is username: seq|ts|EVENT|username|... */
         char copy[AUDIT_LINE_MAX];
         strncpy(copy, linebuf, sizeof(copy) - 1);
         copy[sizeof(copy)-1] = '\0';
 
+        char *fields[8];
         int fi = 0;
         char *tok = strtok(copy, "|");
-        while (tok && fi < 7) { fields[fi++] = tok; tok = strtok(NULL, "|"); }
-
-        if (fi < 7) continue;
+        while (tok && fi < 8) { fields[fi++] = tok; tok = strtok(NULL, "|"); }
+        if (fi < 5) continue;
         if (strncmp(fields[3], username, MAX_USERNAME) != 0) continue;
 
-        /* Store into ring buffer */
         free(ring[head]);
         ring[head] = strdup(linebuf);
         head = (head + 1) % n;
@@ -117,13 +113,11 @@ int audit_history(const char *username, int n, int fd) {
     }
     fclose(rfp);
 
-    /* Emit in order: oldest first */
     int written = 0;
     int start = (count < n) ? 0 : head;
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % n;
         if (ring[idx]) {
-            /* strip trailing newline before sendline adds its own */
             size_t len = strlen(ring[idx]);
             if (len > 0 && ring[idx][len-1] == '\n')
                 ring[idx][len-1] = '\0';

@@ -1,34 +1,37 @@
 #ifndef AUDIT_H
 #define AUDIT_H
 
+#include <stdint.h>
+
 /*
  * Append-only audit log.
  *
- * Every entry is written under a mutex so lines never interleave.
- * A global monotonically-increasing sequence counter gives each entry
- * a unique, ordered identifier.
+ * All writes are serialised by an internal mutex; entries never interleave.
+ * A monotonically-increasing sequence number orders every entry absolutely.
  *
  * Format (pipe-delimited for easy grep/awk):
  *   seq|ISO-8601-ts|EVENT|username|detail|amount|RESULT
+ *
+ * `amount` is written as "rupees.paise" (e.g. "100.50"); use 0 for
+ * non-monetary events.
  */
 
-/* Call once at startup. Returns 0 on success, -1 on error. */
-int audit_init(const char *log_path);
+/* Initialise: open (or create) the log file.  Returns 0/-1. */
+int  audit_init(const char *log_path);
 
-/* Call at shutdown to flush and close the log file. */
+/* Flush and close the log file. */
 void audit_close(void);
 
 /*
- * Log one event.  amount may be 0.0 for non-monetary events.
- * result should be "OK" or "ERR".
+ * Append one entry.  amount_paise may be 0 for non-monetary events.
+ * result must be "OK" or "ERR".
  */
 void audit_log(const char *event, const char *username,
-               const char *detail, double amount,
+               const char *detail, int64_t amount_paise,
                const char *result);
 
 /*
- * Scan the audit log and write the last `n` lines whose username field
- * matches `username` to the file descriptor `fd`.
+ * Stream the last `n` entries for `username` to file descriptor `fd`.
  * Returns the number of lines written.
  */
 int audit_history(const char *username, int n, int fd);
