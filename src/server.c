@@ -2,29 +2,27 @@
  * server.c – VaultNet TCP server
  *
  * Architecture:
- *   - Main thread: accept loop + signal handling
- *   - Worker threads: one per job, drawn from a bounded thread pool
- *   - Each accepted client fd is wrapped in a ClientConn and submitted as a job
- *   - Session state (logged-in username) lives on the stack of the worker
+ *   Main thread  →  accept loop  →  job queue  →  64 worker threads
+ *   Session state (logged-in user, failed-login counter) lives per-worker.
  *
- * Shutdown sequence (SIGINT / SIGTERM):
- *   1. g_running = 0
- *   2. close(g_listen_fd) to unblock accept()
- *   3. threadpool_destroy() drains in-flight work and joins workers
- *   4. audit_close() flushes log
- *   5. accounts_shutdown() final persist
+ * TLS:  pass cert and key file paths as argv[2] and argv[3] to enable TLS.
+ *       Without them the server runs in plaintext mode (useful for tests).
+ *
+ * Shutdown: SIGINT/SIGTERM → stop accepting → drain pool → flush logs.
  */
 
 #include "protocol.h"
 #include "netutil.h"
+#include "tlsutil.h"
 #include "accounts.h"
-#include "auth.h"
+#include "wal.h"
 #include "audit.h"
 #include "threadpool.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -33,69 +31,172 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
 
-static volatile sig_atomic_t g_running = 1;
-static int                   g_listen_fd = -1;
+static volatile sig_atomic_t g_running     = 1;
+static int                   g_listen_fd   = -1;
+static int                   g_lockfile_fd = -1;
 static ThreadPool            g_pool;
+static SSL_CTX              *g_ssl_ctx     = NULL; /* NULL = plaintext mode */
+/* Self-pipe: signal handler writes 1 byte; accept loop reads it to wake up */
+static int                   g_pipe[2]     = {-1, -1};
+
+/* ── startup lockfile ────────────────────────────────────────────────────── */
+
+static int acquire_lockfile(void) {
+    g_lockfile_fd = open(LOCK_FILE, O_RDWR | O_CREAT, 0600);
+    if (g_lockfile_fd < 0) { perror("lockfile: open"); return -1; }
+
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type   = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+
+    if (fcntl(g_lockfile_fd, F_SETLK, &fl) < 0) {
+        if (errno == EACCES || errno == EAGAIN)
+            fprintf(stderr, "VaultNet: another instance is already running "
+                            "(lock held on %s)\n", LOCK_FILE);
+        else
+            perror("lockfile: fcntl");
+        close(g_lockfile_fd);
+        g_lockfile_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void release_lockfile(void) {
+    if (g_lockfile_fd >= 0) {
+        close(g_lockfile_fd);
+        g_lockfile_fd = -1;
+    }
+}
 
 /* ── signal handler ──────────────────────────────────────────────────────── */
 
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
-    /* Closing the listen fd wakes up the blocked accept() call */
-    if (g_listen_fd >= 0) {
+    if (g_pipe[1] >= 0) {
+        char b = 1;
+        (void)write(g_pipe[1], &b, 1);
+    } else if (g_listen_fd >= 0) {
         close(g_listen_fd);
         g_listen_fd = -1;
     }
 }
 
-/* ── per-connection job ──────────────────────────────────────────────────── */
+/* ── amount helpers ──────────────────────────────────────────────────────── */
 
-typedef struct {
-    int  fd;
-    char peer_addr[INET_ADDRSTRLEN];
-} ClientConn;
-
-/*
- * Parse a non-negative decimal amount from str.
- * Returns 1 on success (amount > 0), 0 on error.
- */
-static int parse_amount(const char *str, double *out) {
+static int parse_amount(const char *str, int64_t *out_paise) {
     if (!str || *str == '\0') return 0;
-    char *end;
-    errno = 0;
-    double v = strtod(str, &end);
-    if (errno != 0 || end == str || *end != '\0' || v <= 0.0) return 0;
-    *out = v;
+    if (*str == '-' || *str == '+') return 0;
+
+    const char *dot     = strchr(str, '.');
+    const char *int_end = dot ? dot : (str + strlen(str));
+
+    if (int_end == str) return 0;
+
+    int64_t rupees = 0;
+    for (const char *p = str; p < int_end; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+        if (rupees > (INT64_MAX / 10 - 1)) return 0;
+        rupees = rupees * 10 + (*p - '0');
+    }
+
+    int64_t cents = 0;
+    if (dot) {
+        const char *frac = dot + 1;
+        size_t frac_len = strlen(frac);
+        if (frac_len == 0 || frac_len > 2) return 0;
+        for (size_t i = 0; i < frac_len; i++) {
+            if (!isdigit((unsigned char)frac[i])) return 0;
+        }
+        cents = (frac_len == 1)
+                    ? (int64_t)(frac[0] - '0') * 10
+                    : (int64_t)(frac[0] - '0') * 10 + (frac[1] - '0');
+    }
+
+    if (rupees > (INT64_MAX - cents) / 100) return 0;
+    int64_t paise = rupees * 100 + cents;
+    if (paise <= 0) return 0;
+
+    *out_paise = paise;
     return 1;
 }
 
+static void fmt_amount(char *buf, size_t len, int64_t paise) {
+    const char *sign = "";
+    if (paise < 0) { sign = "-"; paise = -paise; }
+    snprintf(buf, len, "%s%" PRId64 ".%02" PRId64,
+             sign, paise / 100, paise % 100);
+}
+
+/* ── input validation ────────────────────────────────────────────────────── */
+
+static int valid_username(const char *u) {
+    size_t len = strlen(u);
+    if (len < MIN_USERNAME_LEN || len > MAX_USERNAME_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = u[i];
+        if (!isalnum((unsigned char)c) && c != '_') return 0;
+    }
+    return 1;
+}
+
+static int valid_password(const char *p) {
+    size_t len = strlen(p);
+    if (len < MIN_PASSWORD_LEN || len >= MAX_PASSWORD) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (isspace((unsigned char)p[i])) return 0;
+    }
+    return 1;
+}
+
+/* ── per-connection handler ───────────────────────────────────────────────── */
+
+typedef struct {
+    VNConn c;
+    char   peer_addr[INET_ADDRSTRLEN];
+} ClientConn;
+
 static void handle_client(void *arg) {
     ClientConn *conn = (ClientConn *)arg;
-    int fd = conn->fd;
+    VNConn     *c    = &conn->c;
 
-    /* Per-session state: who is logged in on this connection */
     char session_user[MAX_USERNAME];
     memset(session_user, 0, sizeof(session_user));
-    int  logged_in = 0;
+    int logged_in     = 0;
+    int failed_logins = 0;
 
     char line[MAX_LINE];
     ssize_t n;
 
-    sendline_fd(fd, "OK VaultNet ready. Send HELP for command list.");
+    vn_sendline(c, "OK VaultNet ready. Send HELP for command list.");
 
-    while ((n = readline_fd(fd, line, sizeof(line))) > 0) {
-        /* Tokenise command line */
+    while ((n = vn_readline(c, line, sizeof(line))) > 0) {
+
+        if (n == (ssize_t)(sizeof(line) - 1)) {
+            vn_drain_line(c);
+            vn_sendline(c, "ERR line too long");
+            continue;
+        }
+
         char *saveptr = NULL;
-        char *cmd  = strtok_r(line, " \t", &saveptr);
-        if (!cmd) { sendline_fd(fd, "ERR empty command"); continue; }
+        char *cmd = strtok_r(line, " \t", &saveptr);
+        if (!cmd) { vn_sendline(c, "ERR empty command"); continue; }
 
         /* ── QUIT ─────────────────────────────────────────────────── */
         if (strcasecmp(cmd, "QUIT") == 0) {
-            sendline_fd(fd, "OK goodbye");
+            vn_sendline(c, "OK goodbye");
             break;
         }
 
@@ -104,19 +205,24 @@ static void handle_client(void *arg) {
             char *user = strtok_r(NULL, " \t", &saveptr);
             char *pass = strtok_r(NULL, " \t", &saveptr);
             if (!user || !pass) {
-                sendline_fd(fd, "ERR usage: REGISTER <username> <password>");
+                vn_sendline(c, "ERR usage: REGISTER <username> <password>");
                 continue;
             }
-            if (strlen(user) >= MAX_USERNAME || strlen(pass) >= MAX_PASSWORD) {
-                sendline_fd(fd, "ERR username or password too long");
+            if (!valid_username(user)) {
+                vn_sendline(c, "ERR username must be 3-32 chars, [A-Za-z0-9_] only");
+                continue;
+            }
+            if (!valid_password(pass)) {
+                vn_sendline(c,
+                    "ERR password must be 8-127 chars with no whitespace");
                 continue;
             }
             if (accounts_register(user, pass) == 0) {
-                audit_log("REGISTER", user, "new account", 0.0, "OK");
-                sendline_fd(fd, "OK account created");
+                audit_log("REGISTER", user, "new account", 0, "OK");
+                vn_sendline(c, "OK account created");
             } else {
-                audit_log("REGISTER", user, "username taken or limit reached", 0.0, "ERR");
-                sendline_fd(fd, "ERR username already taken or server limit reached");
+                audit_log("REGISTER", user, "taken or limit", 0, "ERR");
+                vn_sendline(c, "ERR username already taken or server limit reached");
             }
             continue;
         }
@@ -126,83 +232,75 @@ static void handle_client(void *arg) {
             char *user = strtok_r(NULL, " \t", &saveptr);
             char *pass = strtok_r(NULL, " \t", &saveptr);
             if (!user || !pass) {
-                sendline_fd(fd, "ERR usage: LOGIN <username> <password>");
+                vn_sendline(c, "ERR usage: LOGIN <username> <password>");
                 continue;
             }
             if (logged_in) {
-                sendline_fd(fd, "ERR already logged in; LOGOUT first");
+                vn_sendline(c, "ERR already logged in; LOGOUT first");
                 continue;
             }
             if (accounts_authenticate(user, pass)) {
+                failed_logins = 0;
                 logged_in = 1;
                 strncpy(session_user, user, MAX_USERNAME - 1);
-                audit_log("LOGIN", user, conn->peer_addr, 0.0, "OK");
-                sendlinef(fd, "OK logged in as %s", user);
+                audit_log("LOGIN", user, conn->peer_addr, 0, "OK");
+                vn_sendlinef(c, "OK logged in as %s", user);
             } else {
-                audit_log("LOGIN", user ? user : "?", "bad credentials", 0.0, "ERR");
-                sendline_fd(fd, "ERR invalid username or password");
+                failed_logins++;
+                audit_log("LOGIN", user ? user : "?", "bad credentials", 0, "ERR");
+                if (failed_logins >= MAX_FAILED_LOGINS) {
+                    vn_sendline(c, "ERR too many failed attempts, disconnecting");
+                    break;
+                }
+                vn_sendlinef(c, "ERR invalid username or password (%d/%d attempts)",
+                             failed_logins, MAX_FAILED_LOGINS);
             }
             continue;
         }
 
         /* ── LOGOUT ───────────────────────────────────────────────── */
         if (strcasecmp(cmd, "LOGOUT") == 0) {
-            if (!logged_in) { sendline_fd(fd, "ERR not logged in"); continue; }
-            audit_log("LOGOUT", session_user, "", 0.0, "OK");
+            if (!logged_in) { vn_sendline(c, "ERR not logged in"); continue; }
+            audit_log("LOGOUT", session_user, "", 0, "OK");
             memset(session_user, 0, sizeof(session_user));
             logged_in = 0;
-            sendline_fd(fd, "OK logged out");
+            vn_sendline(c, "OK logged out");
             continue;
         }
 
-        /* All commands below require authentication */
-        if (!logged_in) {
-            sendline_fd(fd, "ERR not logged in");
-            continue;
-        }
+        if (!logged_in) { vn_sendline(c, "ERR not logged in"); continue; }
 
         /* ── BALANCE ──────────────────────────────────────────────── */
         if (strcasecmp(cmd, "BALANCE") == 0) {
-            accounts_rdlock();
-            Account *a = accounts_find_locked(session_user);
-            if (!a) {
-                accounts_rdunlock();
-                sendline_fd(fd, "ERR account not found");
-                continue;
+            int64_t bal = 0;
+            if (accounts_get_balance(session_user, &bal) == 0) {
+                char buf[32];
+                fmt_amount(buf, sizeof(buf), bal);
+                vn_sendlinef(c, "OK balance %s", buf);
+            } else {
+                vn_sendline(c, "ERR account not found");
             }
-            double bal = accounts_balance(a);
-            accounts_unlock(a);
-            accounts_rdunlock();
-            sendlinef(fd, "OK balance %.2f", bal);
             continue;
         }
 
         /* ── DEPOSIT <amount> ─────────────────────────────────────── */
         if (strcasecmp(cmd, "DEPOSIT") == 0) {
             char *amt_str = strtok_r(NULL, " \t", &saveptr);
-            double amount = 0.0;
-            if (!parse_amount(amt_str, &amount)) {
-                sendline_fd(fd, "ERR invalid amount");
+            int64_t paise = 0;
+            if (!parse_amount(amt_str, &paise)) {
+                vn_sendline(c, "ERR invalid amount (positive decimal, max 2 d.p.)");
                 continue;
             }
-            accounts_rdlock();
-            Account *a = accounts_find_locked(session_user);
-            if (!a) {
-                accounts_rdunlock();
-                sendline_fd(fd, "ERR account not found");
-                continue;
-            }
-            if (accounts_deposit(a, amount) == 0) {
-                double bal = accounts_balance(a);
-                accounts_unlock(a);
-                accounts_rdunlock();
-                audit_log("DEPOSIT", session_user, "", amount, "OK");
-                sendlinef(fd, "OK deposited %.2f new_balance %.2f", amount, bal);
+            int64_t bal = 0;
+            if (accounts_deposit(session_user, paise, &bal) == 0) {
+                char a_buf[32], b_buf[32];
+                fmt_amount(a_buf, sizeof(a_buf), paise);
+                fmt_amount(b_buf, sizeof(b_buf), bal);
+                audit_log("DEPOSIT", session_user, "", paise, "OK");
+                vn_sendlinef(c, "OK deposited %s new_balance %s", a_buf, b_buf);
             } else {
-                accounts_unlock(a);
-                accounts_rdunlock();
-                audit_log("DEPOSIT", session_user, "failed", amount, "ERR");
-                sendline_fd(fd, "ERR deposit failed");
+                audit_log("DEPOSIT", session_user, "failed", paise, "ERR");
+                vn_sendline(c, "ERR deposit failed");
             }
             continue;
         }
@@ -210,30 +308,23 @@ static void handle_client(void *arg) {
         /* ── WITHDRAW <amount> ────────────────────────────────────── */
         if (strcasecmp(cmd, "WITHDRAW") == 0) {
             char *amt_str = strtok_r(NULL, " \t", &saveptr);
-            double amount = 0.0;
-            if (!parse_amount(amt_str, &amount)) {
-                sendline_fd(fd, "ERR invalid amount");
+            int64_t paise = 0;
+            if (!parse_amount(amt_str, &paise)) {
+                vn_sendline(c, "ERR invalid amount (positive decimal, max 2 d.p.)");
                 continue;
             }
-            accounts_rdlock();
-            Account *a = accounts_find_locked(session_user);
-            if (!a) {
-                accounts_rdunlock();
-                sendline_fd(fd, "ERR account not found");
-                continue;
-            }
-            if (accounts_withdraw(a, amount) == 0) {
-                double bal = accounts_balance(a);
-                accounts_unlock(a);
-                accounts_rdunlock();
-                audit_log("WITHDRAW", session_user, "", amount, "OK");
-                sendlinef(fd, "OK withdrew %.2f new_balance %.2f", amount, bal);
+            int64_t bal = 0;
+            if (accounts_withdraw(session_user, paise, &bal) == 0) {
+                char a_buf[32], b_buf[32];
+                fmt_amount(a_buf, sizeof(a_buf), paise);
+                fmt_amount(b_buf, sizeof(b_buf), bal);
+                audit_log("WITHDRAW", session_user, "", paise, "OK");
+                vn_sendlinef(c, "OK withdrew %s new_balance %s", a_buf, b_buf);
             } else {
-                double bal = accounts_balance(a);
-                accounts_unlock(a);
-                accounts_rdunlock();
-                audit_log("WITHDRAW", session_user, "insufficient funds", amount, "ERR");
-                sendlinef(fd, "ERR insufficient funds (balance %.2f)", bal);
+                char b_buf[32];
+                fmt_amount(b_buf, sizeof(b_buf), bal);
+                audit_log("WITHDRAW", session_user, "insufficient", paise, "ERR");
+                vn_sendlinef(c, "ERR insufficient funds (balance %s)", b_buf);
             }
             continue;
         }
@@ -242,100 +333,60 @@ static void handle_client(void *arg) {
         if (strcasecmp(cmd, "TRANSFER") == 0) {
             char *to_user = strtok_r(NULL, " \t", &saveptr);
             char *amt_str = strtok_r(NULL, " \t", &saveptr);
-            double amount = 0.0;
-            if (!to_user || !parse_amount(amt_str, &amount)) {
-                sendline_fd(fd, "ERR usage: TRANSFER <username> <amount>");
+            int64_t paise = 0;
+            if (!to_user || !parse_amount(amt_str, &paise)) {
+                vn_sendline(c, "ERR usage: TRANSFER <username> <amount>");
                 continue;
             }
             if (strncmp(to_user, session_user, MAX_USERNAME) == 0) {
-                sendline_fd(fd, "ERR cannot transfer to yourself");
+                vn_sendline(c, "ERR cannot transfer to yourself");
                 continue;
             }
-
-            accounts_rdlock();
-            /* Find source; do NOT lock it here — accounts_transfer does that */
-            Account *src = NULL, *dst = NULL;
-            for (int i = 0; i < MAX_ACCOUNTS; i++) {
-                /* Access g_accounts directly isn't safe via the public API,
-                 * but accounts_find_locked would lock them — we need both
-                 * unlocked so accounts_transfer can lock in order.
-                 * So we locate pointers without locking. */
-                /* We use a private helper below. */
-                (void)i; /* handled via accounts_find_unlocked approach */
-                break;
-            }
-
-            /*
-             * We need unlocked pointers to pass to accounts_transfer.
-             * accounts_find_locked returns a LOCKED pointer — wrong here.
-             * Solution: call accounts_find_locked for src, immediately unlock,
-             * find dst the same way, then pass both to accounts_transfer which
-             * re-acquires them in correct order.
-             *
-             * This is safe because:
-             *  - accounts_rdlock() prevents any account from being REMOVED
-             *    while we hold it (only REGISTER takes the write lock).
-             *  - accounts_transfer re-locks in the deterministic order.
-             */
-            src = accounts_find_locked(session_user);
-            if (src) accounts_unlock(src);
-
-            dst = accounts_find_locked(to_user);
-            if (dst) accounts_unlock(dst);
-
-            if (!src || !dst) {
-                accounts_rdunlock();
-                sendline_fd(fd, "ERR one or both accounts not found");
-                continue;
-            }
-
-            if (accounts_transfer(src, dst, amount) == 0) {
-                /* Re-lock src to read the updated balance */
-                pthread_mutex_lock(&src->lock);
-                double bal = src->balance;
-                pthread_mutex_unlock(&src->lock);
-                accounts_rdunlock();
-
+            int64_t src_bal = 0;
+            if (accounts_transfer(session_user, to_user, paise, &src_bal) == 0) {
+                char a_buf[32], b_buf[32];
+                fmt_amount(a_buf, sizeof(a_buf), paise);
+                fmt_amount(b_buf, sizeof(b_buf), src_bal);
                 char detail[128];
                 snprintf(detail, sizeof(detail), "to:%s", to_user);
-                audit_log("TRANSFER", session_user, detail, amount, "OK");
-                sendlinef(fd, "OK transferred %.2f to %s new_balance %.2f",
-                          amount, to_user, bal);
+                audit_log("TRANSFER", session_user, detail, paise, "OK");
+                vn_sendlinef(c, "OK transferred %s to %s new_balance %s",
+                             a_buf, to_user, b_buf);
             } else {
-                /* Read src balance for the error message */
-                pthread_mutex_lock(&src->lock);
-                double bal = src->balance;
-                pthread_mutex_unlock(&src->lock);
-                accounts_rdunlock();
-
+                char b_buf[32];
+                fmt_amount(b_buf, sizeof(b_buf), src_bal);
                 char detail[128];
                 snprintf(detail, sizeof(detail), "to:%s insufficient", to_user);
-                audit_log("TRANSFER", session_user, detail, amount, "ERR");
-                sendlinef(fd, "ERR transfer failed (balance %.2f)", bal);
+                audit_log("TRANSFER", session_user, detail, paise, "ERR");
+                vn_sendlinef(c, "ERR transfer failed (balance %s)", b_buf);
             }
             continue;
         }
 
         /* ── HISTORY ──────────────────────────────────────────────── */
         if (strcasecmp(cmd, "HISTORY") == 0) {
-            sendlinef(fd, "OK history for %s:", session_user);
-            int cnt = audit_history(session_user, HISTORY_PER_ACCT, fd);
-            sendlinef(fd, "END %d records", cnt);
+            vn_sendlinef(c, "OK history for %s:", session_user);
+            int cnt = audit_history(session_user, HISTORY_PER_ACCT, c->fd);
+            vn_sendlinef(c, "END %d records", cnt);
             continue;
         }
 
         /* ── HELP ─────────────────────────────────────────────────── */
         if (strcasecmp(cmd, "HELP") == 0) {
-            sendline_fd(fd, "OK commands: REGISTER LOGIN LOGOUT BALANCE DEPOSIT WITHDRAW TRANSFER HISTORY QUIT");
+            vn_sendline(c, "OK commands: REGISTER LOGIN LOGOUT BALANCE "
+                           "DEPOSIT WITHDRAW TRANSFER HISTORY QUIT");
             continue;
         }
 
-        sendlinef(fd, "ERR unknown command: %s", cmd);
+        vn_sendlinef(c, "ERR unknown command: %s", cmd);
     }
 
-    if (n < 0) perror("readline_fd");
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            vn_sendline(c, "ERR idle timeout, disconnecting");
+    }
 
-    close(fd);
+    vn_close(c);
     free(conn);
 }
 
@@ -346,8 +397,7 @@ static int make_listen_socket(int port) {
     if (fd < 0) { perror("socket"); return -1; }
 
     int yes = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)
-        perror("setsockopt SO_REUSEADDR");
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -364,17 +414,78 @@ static int make_listen_socket(int port) {
     return fd;
 }
 
+/* Accept one connection, optionally do TLS handshake, hand off to pool. */
+static void accept_and_dispatch(void) {
+    struct sockaddr_in ca;
+    socklen_t cal = sizeof(ca);
+    int cfd = accept(g_listen_fd, (struct sockaddr *)&ca, &cal);
+    if (cfd < 0) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+            if (errno != EBADF) perror("accept");
+        return;
+    }
+
+    struct timeval tv = { .tv_sec = CONN_IDLE_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    SSL *ssl = NULL;
+    if (g_ssl_ctx) {
+        ssl = SSL_new(g_ssl_ctx);
+        SSL_set_fd(ssl, cfd);
+        if (SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(cfd);
+            return;
+        }
+    }
+
+    ClientConn *conn = malloc(sizeof(ClientConn));
+    if (!conn) {
+        fprintf(stderr, "malloc failed\n");
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+        close(cfd);
+        return;
+    }
+    conn->c.fd  = cfd;
+    conn->c.ssl = ssl;
+    inet_ntop(AF_INET, &ca.sin_addr, conn->peer_addr, sizeof(conn->peer_addr));
+
+    if (threadpool_submit(&g_pool, handle_client, conn) < 0) {
+        vn_sendline(&conn->c, "ERR server busy, try again");
+        vn_close(&conn->c);
+        free(conn);
+    }
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
     if (argc >= 2) port = atoi(argv[1]);
 
-    /* Initialise subsystems */
-    if (accounts_init(ACCOUNTS_FILE) < 0) {
-        fprintf(stderr, "Failed to load accounts\n");
+    /* Optional TLS: vaultnet_server <port> <cert.pem> <key.pem> */
+    if (argc >= 4) {
+        g_ssl_ctx = tls_server_ctx(argv[2], argv[3]);
+        if (!g_ssl_ctx) return 1;
+        fprintf(stdout, "TLS enabled (cert=%s)\n", argv[2]);
+    }
+
+    if (acquire_lockfile() < 0) return 1;
+
+    if (accounts_init(SNAP_FILE) < 0) {
+        fprintf(stderr, "Failed to load snapshot\n");
         return 1;
     }
+    if (wal_replay(WAL_FILE, accounts_snap_lsn()) < 0) {
+        fprintf(stderr, "WAL replay failed\n");
+        return 1;
+    }
+    if (wal_init(WAL_FILE) < 0) {
+        fprintf(stderr, "Failed to open WAL\n");
+        return 1;
+    }
+
     if (audit_init(AUDIT_FILE) < 0) {
         fprintf(stderr, "Failed to open audit log\n");
         return 1;
@@ -384,64 +495,80 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Install signal handlers */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    /* Ignore SIGPIPE so writing to a closed client doesn't kill the server */
     signal(SIGPIPE, SIG_IGN);
 
     g_listen_fd = make_listen_socket(port);
     if (g_listen_fd < 0) return 1;
 
     fprintf(stdout, "VaultNet server listening on port %d  "
-                    "(pool=%d threads, queue=%d jobs)\n",
-            port, THREADPOOL_SIZE, QUEUE_CAPACITY);
+                    "(pool=%d threads, queue=%d jobs%s)\n",
+            port, THREADPOOL_SIZE, QUEUE_CAPACITY,
+            g_ssl_ctx ? ", TLS" : "");
     fflush(stdout);
 
-    /* Accept loop */
-    struct sockaddr_in client_addr;
-    socklen_t addr_len;
+#ifdef __linux__
+    /* ── epoll accept loop (Linux) ────────────────────────────────────────── */
+    {
+        if (pipe(g_pipe) < 0) { perror("pipe"); return 1; }
+        fcntl(g_pipe[1], F_SETFL, fcntl(g_pipe[1], F_GETFL) | O_NONBLOCK);
 
-    while (g_running) {
-        addr_len = sizeof(client_addr);
-        int client_fd = accept(g_listen_fd,
-                               (struct sockaddr *)&client_addr, &addr_len);
-        if (client_fd < 0) {
-            if (errno == EINTR || errno == EBADF) break; /* shutdown */
-            perror("accept");
-            continue;
-        }
+        int ep = epoll_create1(EPOLL_CLOEXEC);
+        if (ep < 0) { perror("epoll_create1"); return 1; }
 
-        ClientConn *conn = malloc(sizeof(ClientConn));
-        if (!conn) {
-            fprintf(stderr, "malloc failed for ClientConn\n");
-            close(client_fd);
-            continue;
-        }
-        conn->fd = client_fd;
-        inet_ntop(AF_INET, &client_addr.sin_addr,
-                  conn->peer_addr, sizeof(conn->peer_addr));
+        struct epoll_event ev;
+        ev.events  = EPOLLIN;
+        ev.data.fd = g_listen_fd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_listen_fd, &ev);
+        ev.data.fd = g_pipe[0];
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_pipe[0], &ev);
 
-        if (threadpool_submit(&g_pool, handle_client, conn) < 0) {
-            fprintf(stderr, "pool full, dropping connection from %s\n",
-                    conn->peer_addr);
-            sendline_fd(client_fd, "ERR server busy, try again");
-            close(client_fd);
-            free(conn);
+        struct epoll_event events[32];
+        int done = 0;
+        while (g_running && !done) {
+            int n = epoll_wait(ep, events, 32, -1);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            for (int i = 0; i < n && !done; i++) {
+                if (events[i].data.fd == g_pipe[0])  { done = 1; break; }
+                if (events[i].data.fd == g_listen_fd) accept_and_dispatch();
+            }
         }
+        close(ep);
     }
+#else
+    /* ── blocking accept loop (macOS / other POSIX) ─────────────────────── */
+    while (g_running) {
+        accept_and_dispatch();
+    }
+#endif
 
     fprintf(stdout, "\nShutting down...\n");
     fflush(stdout);
 
+    if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+    if (g_pipe[0]   >= 0) { close(g_pipe[0]);   g_pipe[0]   = -1; }
+    if (g_pipe[1]   >= 0) { close(g_pipe[1]);   g_pipe[1]   = -1; }
+
     threadpool_destroy(&g_pool);
     accounts_shutdown();
-    audit_log("SERVER", "system", "shutdown", 0.0, "OK");
+    wal_shutdown();
+    audit_log("SERVER", "system", "shutdown", 0, "OK");
     audit_close();
+
+    if (g_ssl_ctx) {
+        SSL_CTX_free(g_ssl_ctx);
+        g_ssl_ctx = NULL;
+    }
+
+    release_lockfile();
 
     fprintf(stdout, "VaultNet shut down cleanly.\n");
     return 0;
