@@ -52,7 +52,7 @@ static int                   g_pipe[2]     = {-1, -1};
 /* ── startup lockfile ────────────────────────────────────────────────────── */
 
 static int acquire_lockfile(void) {
-    g_lockfile_fd = open(LOCK_FILE, O_RDWR | O_CREAT, 0600);
+    g_lockfile_fd = open(LOCK_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (g_lockfile_fd < 0) { perror("lockfile: open"); return -1; }
 
     struct flock fl;
@@ -66,6 +66,13 @@ static int acquire_lockfile(void) {
                             "(lock held on %s)\n", LOCK_FILE);
         else
             perror("lockfile: fcntl");
+        close(g_lockfile_fd);
+        g_lockfile_fd = -1;
+        return -1;
+    }
+    if (ftruncate(g_lockfile_fd, 0) < 0 ||
+        dprintf(g_lockfile_fd, "%ld\n", (long)getpid()) < 0) {
+        perror("lockfile: write pid");
         close(g_lockfile_fd);
         g_lockfile_fd = -1;
         return -1;
