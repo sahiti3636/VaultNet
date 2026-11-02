@@ -1,5 +1,4 @@
 #include "audit.h"
-#include "netutil.h"
 #include "protocol.h"
 
 #include <stdio.h>
@@ -77,7 +76,7 @@ void audit_log(const char *event, const char *username,
     pthread_mutex_unlock(&g_log_mtx);
 }
 
-int audit_history(const char *username, int n, int fd) {
+int audit_history(const char *username, int n, VNConn *conn) {
     if (!g_log_fp || n <= 0) return 0;
 
     pthread_mutex_lock(&g_log_mtx);
@@ -121,8 +120,7 @@ int audit_history(const char *username, int n, int fd) {
             size_t len = strlen(ring[idx]);
             if (len > 0 && ring[idx][len-1] == '\n')
                 ring[idx][len-1] = '\0';
-            sendline_fd(fd, ring[idx]);
-            written++;
+            if (vn_sendline(conn, ring[idx]) == 0) written++;
         }
     }
 

@@ -47,7 +47,8 @@ UNIT_SRCS := tests/unit.c \
              $(SRCDIR)/wal.c \
              $(SRCDIR)/auth.c \
              $(SRCDIR)/audit.c \
-             $(SRCDIR)/netutil.c
+             $(SRCDIR)/netutil.c \
+             $(SRCDIR)/tlsutil.c
 
 UNIT_BIN  := $(BINDIR)/vaultnet_unit
 

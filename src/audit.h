@@ -2,6 +2,7 @@
 #define AUDIT_H
 
 #include <stdint.h>
+#include "tlsutil.h"
 
 /*
  * Append-only audit log.
@@ -31,9 +32,9 @@ void audit_log(const char *event, const char *username,
                const char *result);
 
 /*
- * Stream the last `n` entries for `username` to file descriptor `fd`.
+ * Stream the last `n` entries for `username` over `conn`.
  * Returns the number of lines written.
  */
-int audit_history(const char *username, int n, int fd);
+int audit_history(const char *username, int n, VNConn *conn);
 
 #endif /* AUDIT_H */

@@ -383,7 +383,7 @@ static void handle_client(void *arg) {
         /* ── HISTORY ──────────────────────────────────────────────── */
         if (strcasecmp(cmd, "HISTORY") == 0) {
             vn_sendlinef(c, "OK history for %s:", session_user);
-            int cnt = audit_history(session_user, HISTORY_PER_ACCT, c->fd);
+            int cnt = audit_history(session_user, HISTORY_PER_ACCT, c);
             vn_sendlinef(c, "END %d records", cnt);
             continue;
         }

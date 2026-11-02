@@ -1,18 +1,18 @@
 /*
  * client.c – VaultNet interactive command-line client
  *
- * Usage: vaultnet_client [host [port]]
+ * Usage: vaultnet_client [host [port [--tls]]]
+ *
+ *   --tls   connect with TLS (accepts self-signed certificates)
  *
  * Connects to the server, then enters a read-eval loop:
  *   - read a line from stdin
  *   - send it to the server
  *   - print every response line until a line starting with OK/ERR/END
- *
- * Multi-line responses (HISTORY) are terminated by a line starting with "END".
  */
 
 #include "protocol.h"
-#include "netutil.h"
+#include "tlsutil.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <openssl/ssl.h>
 
 #define DEFAULT_HOST "127.0.0.1"
 
@@ -51,24 +52,64 @@ static int connect_to_server(const char *host, int port) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *host = DEFAULT_HOST;
-    int         port = DEFAULT_PORT;
+    const char *host  = DEFAULT_HOST;
+    int         port  = DEFAULT_PORT;
+    int         use_tls = 0;
 
-    if (argc >= 2) host = argv[1];
-    if (argc >= 3) port = atoi(argv[2]);
+    /* Parse positional arguments and --tls in any order. */
+    int positionals = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--tls") == 0) {
+            use_tls = 1;
+        } else if (positionals++ == 0) {
+            host = argv[i];
+        } else if (positionals == 2) {
+            char *end = NULL;
+            long parsed = strtol(argv[i], &end, 10);
+            if (!end || *end != '\0' || parsed < 1 || parsed > 65535) {
+                fprintf(stderr, "Invalid port: %s\n", argv[i]);
+                return 1;
+            }
+            port = (int)parsed;
+        } else {
+            fprintf(stderr, "Usage: %s [host [port]] [--tls]\n", argv[0]);
+            return 1;
+        }
+    }
 
     int fd = connect_to_server(host, port);
     if (fd < 0) return 1;
 
-    fprintf(stdout, "Connected to %s:%d  (type HELP for commands, QUIT to exit)\n",
-            host, port);
+    VNConn vc;
+    vc.fd  = fd;
+    vc.ssl = NULL;
+
+    if (use_tls) {
+        SSL_CTX *ctx = tls_client_ctx(0);  /* 0 = accept self-signed */
+        if (!ctx) { close(fd); return 1; }
+        SSL *ssl = SSL_new(ctx);
+        SSL_CTX_free(ctx);
+        if (!ssl) { close(fd); return 1; }
+        SSL_set_fd(ssl, fd);
+        if (SSL_connect(ssl) <= 0) {
+            fprintf(stderr, "TLS handshake failed\n");
+            SSL_free(ssl);
+            close(fd);
+            return 1;
+        }
+        vc.ssl = ssl;
+        fprintf(stdout, "TLS connected to %s:%d\n", host, port);
+    } else {
+        fprintf(stdout, "Connected to %s:%d  (type HELP for commands, QUIT to exit)\n",
+                host, port);
+    }
 
     char line[MAX_LINE];
     ssize_t n;
 
     /* Print the server's initial greeting */
-    n = readline_fd(fd, line, sizeof(line));
-    if (n <= 0) { fprintf(stderr, "server closed immediately\n"); close(fd); return 1; }
+    n = vn_readline(&vc, line, sizeof(line));
+    if (n <= 0) { fprintf(stderr, "server closed immediately\n"); vn_close(&vc); return 1; }
     printf("< %s\n", line);
 
     /* Interactive loop */
@@ -76,33 +117,27 @@ int main(int argc, char *argv[]) {
         printf("> ");
         fflush(stdout);
 
-        if (!fgets(line, sizeof(line), stdin)) break; /* EOF / Ctrl-D */
+        if (!fgets(line, sizeof(line), stdin)) break;
 
-        /* Strip newline */
         size_t len = strlen(line);
         if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
         if (len == 0) continue;
 
-        /* Send to server */
-        if (sendline_fd(fd, line) < 0) {
-            perror("sendline_fd");
+        if (vn_sendline(&vc, line) < 0) {
+            perror("vn_sendline");
             break;
         }
 
-        /* Detect QUIT so we can exit after the reply */
         int quitting = (strcasecmp(line, "QUIT") == 0);
 
-        /* Read response lines until a final status (OK / ERR / END) */
         for (;;) {
-            n = readline_fd(fd, line, sizeof(line));
-            if (n < 0) { perror("readline_fd"); goto done; }
+            n = vn_readline(&vc, line, sizeof(line));
+            if (n < 0) { perror("vn_readline"); goto done; }
             if (n == 0) { printf("(server closed connection)\n"); goto done; }
 
             printf("< %s\n", line);
 
-            /* END terminates multi-line responses */
             if (strncmp(line, "END", 3) == 0) break;
-            /* Single-line terminal statuses */
             if (strncmp(line, "OK",  2) == 0 ||
                 strncmp(line, "ERR", 3) == 0) break;
         }
@@ -111,6 +146,6 @@ int main(int argc, char *argv[]) {
     }
 
 done:
-    close(fd);
+    vn_close(&vc);
     return 0;
 }
