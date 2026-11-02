@@ -188,6 +188,18 @@ proving no money is created or destroyed under heavy concurrent access.
 RESULT: PASS – money conserved under 60 concurrent clients
 ```
 
+### Multi-account transfer stress
+
+```bash
+bash tests/stress.sh
+SERVER_BIN=./bin/vaultnet_server_tsan bash tests/stress.sh
+```
+
+Seeds 20 accounts, then uses 32 persistent connections to make random
+transfers for 3 seconds. It checks every balance is nonnegative and the
+final total equals the seeded total exactly. CI also runs this workload
+against the ThreadSanitizer server.
+
 ### Crash recovery test
 
 ```bash
@@ -222,7 +234,7 @@ RESULT: PASS – TLS handshake + REGISTER + DEPOSIT + BALANCE + bad-auth all OK
 make check
 ```
 
-Runs unit tests, concurrency test, and crash recovery test in sequence.
+Runs unit tests, the two concurrency tests, and crash recovery in sequence.
 
 ### Sanitizer builds
 
@@ -389,6 +401,8 @@ tests/
   loadgen.c     C load generator with latency percentiles
   crash_test.c  Concurrent crash recovery verifier
   crash_test.sh Builds and runs the C verifier
+  stress.c      20-account random transfer stress client
+  stress.sh     Runs stress client against isolated server data
   tls_smoke.sh  TLS end-to-end smoke test
 
 gen_cert.sh     Self-signed dev certificate generator (10-year, localhost SANs)
@@ -405,12 +419,12 @@ Two GitHub Actions jobs on every push to `main`:
 
 **`build-and-test`** (ubuntu-latest):
 - Installs `libssl-dev`, builds server + client + unit + loadgen
-- Runs unit tests, concurrency test, crash recovery test
+- Runs unit tests, both concurrency tests, and crash recovery test
 - Generates a cert and runs the TLS smoke test
 - Runs a benchmark smoke (8 s, 8 connections)
 
 **`sanitizers`** (ubuntu-latest):
-- Builds with `-fsanitize=thread` and runs the TSan concurrency stress test
+- Builds with `-fsanitize=thread` and runs the 20-account transfer stress test
 - Builds with `-fsanitize=address,undefined` and runs the ASan smoke test
 
 ---

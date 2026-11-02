@@ -55,12 +55,13 @@ UNIT_BIN  := $(BINDIR)/vaultnet_unit
 LOADGEN_SRCS := tests/loadgen.c
 LOADGEN_BIN  := $(BINDIR)/vaultnet_loadgen
 CRASH_BIN    := $(BINDIR)/vaultnet_crash_test
+STRESS_BIN   := $(BINDIR)/vaultnet_stress
 
 DEFAULT_PORT := 18080
 TLS_CERT     := vaultnet.crt
 TLS_KEY      := vaultnet.key
 
-.PHONY: all server client clean tsan asan unit check loadgen bench crash-test \
+.PHONY: all server client clean tsan asan unit check loadgen bench crash-test stress \
         gen-cert tls-smoke
 
 all: server client
@@ -118,6 +119,11 @@ crash-test: $(CRASH_BIN)
 $(CRASH_BIN): tests/crash_test.c | $(BINDIR)
 	$(CC) $(CFLAGS) tests/crash_test.c -o $@ $(LDFLAGS)
 
+stress: $(STRESS_BIN)
+
+$(STRESS_BIN): tests/stress.c | $(BINDIR)
+	$(CC) $(CFLAGS) tests/stress.c -o $@ $(LDFLAGS)
+
 $(LOADGEN_BIN): $(LOADGEN_SRCS) | $(BINDIR)
 	$(CC) $(CFLAGS) $(LOADGEN_SRCS) -o $@ $(LDFLAGS)
 
@@ -147,6 +153,8 @@ check: unit
 	./$(UNIT_BIN)
 	@echo "--- concurrency test ---"
 	bash test_concurrency.sh
+	@echo "--- 20-account transfer stress ---"
+	bash tests/stress.sh
 	@echo "--- crash recovery test ---"
 	bash tests/crash_test.sh
 
