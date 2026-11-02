@@ -1,9 +1,11 @@
 /*
  * client.c – VaultNet interactive command-line client
  *
- * Usage: vaultnet_client [host [port [--tls]]]
+ * Usage: vaultnet_client [host [port]] [--tls] [--cafile PATH] [--insecure]
  *
- *   --tls   connect with TLS (accepts self-signed certificates)
+ *   --tls      connect with TLS and verify the server certificate
+ *   --cafile   trust certificates from PATH instead of system defaults
+ *   --insecure disable certificate verification for local testing
  *
  * Connects to the server, then enters a read-eval loop:
  *   - read a line from stdin
@@ -55,11 +57,23 @@ int main(int argc, char *argv[]) {
     const char *host  = DEFAULT_HOST;
     int         port  = DEFAULT_PORT;
     int         use_tls = 0;
+    int         insecure = 0;
+    const char *cafile = NULL;
 
     /* Parse positional arguments and --tls in any order. */
     int positionals = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tls") == 0) {
+            use_tls = 1;
+        } else if (strcmp(argv[i], "--cafile") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--cafile requires a path\n");
+                return 1;
+            }
+            cafile = argv[i];
+            use_tls = 1;
+        } else if (strcmp(argv[i], "--insecure") == 0) {
+            insecure = 1;
             use_tls = 1;
         } else if (positionals++ == 0) {
             host = argv[i];
@@ -72,9 +86,14 @@ int main(int argc, char *argv[]) {
             }
             port = (int)parsed;
         } else {
-            fprintf(stderr, "Usage: %s [host [port]] [--tls]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [host [port]] [--tls] "
+                            "[--cafile PATH] [--insecure]\n", argv[0]);
             return 1;
         }
+    }
+    if (insecure && cafile) {
+        fprintf(stderr, "--insecure cannot be combined with --cafile\n");
+        return 1;
     }
 
     int fd = connect_to_server(host, port);
@@ -85,14 +104,31 @@ int main(int argc, char *argv[]) {
     vc.ssl = NULL;
 
     if (use_tls) {
-        SSL_CTX *ctx = tls_client_ctx(0);  /* 0 = accept self-signed */
+        if (insecure)
+            fprintf(stderr, "WARNING: TLS certificate verification disabled\n");
+        SSL_CTX *ctx = tls_client_ctx(cafile, insecure);
         if (!ctx) { close(fd); return 1; }
         SSL *ssl = SSL_new(ctx);
         SSL_CTX_free(ctx);
         if (!ssl) { close(fd); return 1; }
-        SSL_set_fd(ssl, fd);
+        struct in_addr numeric_host;
+        if (SSL_set_fd(ssl, fd) != 1 ||
+            (inet_pton(AF_INET, host, &numeric_host) != 1 &&
+             SSL_set_tlsext_host_name(ssl, host) != 1) ||
+            (!insecure && SSL_set1_host(ssl, host) != 1)) {
+            fprintf(stderr, "TLS setup failed\n");
+            SSL_free(ssl);
+            close(fd);
+            return 1;
+        }
         if (SSL_connect(ssl) <= 0) {
-            fprintf(stderr, "TLS handshake failed\n");
+            fprintf(stderr, "TLS handshake or certificate verification failed\n");
+            SSL_free(ssl);
+            close(fd);
+            return 1;
+        }
+        if (!insecure && SSL_get_verify_result(ssl) != X509_V_OK) {
+            fprintf(stderr, "TLS certificate verification failed\n");
             SSL_free(ssl);
             close(fd);
             return 1;

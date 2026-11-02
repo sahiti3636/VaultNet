@@ -42,9 +42,9 @@ void vn_close(VNConn *c);
 SSL_CTX *tls_server_ctx(const char *certfile, const char *keyfile);
 
 /*
- * Create a client SSL_CTX.
- * verify_peer=0 accepts self-signed certificates (development / testing).
+ * Create a client SSL_CTX. Verification is on unless insecure is nonzero.
+ * cafile may be NULL to use the system trust store.
  */
-SSL_CTX *tls_client_ctx(int verify_peer);
+SSL_CTX *tls_client_ctx(const char *cafile, int insecure);
 
 #endif /* TLSUTIL_H */

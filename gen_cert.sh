@@ -21,6 +21,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "$KEY" -out "$CERT" \
     -sha256 -days "$DAYS" -nodes \
     -subj "/CN=vaultnet-dev/O=VaultNet/C=US" \
     -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+    -addext "extendedKeyUsage=serverAuth" \
     2>/dev/null
 
 echo "Generated: $CERT  $KEY  (self-signed, valid ${DAYS} days)"

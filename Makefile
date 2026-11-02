@@ -134,7 +134,7 @@ tls-smoke: server gen-cert
 	  (cd "$$work_dir" && "$$server_bin" $(DEFAULT_PORT) "$$cert" "$$key") & server_pid=$$!; \
 	  trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$work_dir"' EXIT; \
 	  sleep 0.8; \
-	  bash tests/tls_smoke.sh $(DEFAULT_PORT)
+	  bash tests/tls_smoke.sh $(DEFAULT_PORT) $(TLS_CERT)
 
 check: unit
 	@echo "--- unit tests ---"

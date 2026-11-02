@@ -141,16 +141,26 @@ SSL_CTX *tls_server_ctx(const char *certfile, const char *keyfile) {
     return ctx;
 }
 
-SSL_CTX *tls_client_ctx(int verify_peer) {
+SSL_CTX *tls_client_ctx(const char *cafile, int insecure) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { ERR_print_errors_fp(stderr); return NULL; }
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
-    if (!verify_peer)
+    if (insecure) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    else
-        SSL_CTX_set_default_verify_paths(ctx);
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        int ok = cafile ? SSL_CTX_load_verify_locations(ctx, cafile, NULL)
+                        : SSL_CTX_set_default_verify_paths(ctx);
+        if (ok != 1) {
+            fprintf(stderr, "TLS: cannot load trust store%s%s\n",
+                    cafile ? " " : "", cafile ? cafile : "");
+            ERR_print_errors_fp(stderr);
+            SSL_CTX_free(ctx);
+            return NULL;
+        }
+    }
 
     return ctx;
 }

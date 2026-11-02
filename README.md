@@ -93,7 +93,7 @@ Start the server with cert and key:
 Connect with TLS:
 
 ```bash
-./bin/vaultnet_client 127.0.0.1 18080 --tls
+./bin/vaultnet_client 127.0.0.1 18080 --tls --cafile vaultnet.crt
 ```
 
 Run the TLS smoke test end-to-end:
@@ -202,7 +202,8 @@ bash tests/tls_smoke.sh [port]
 ```
 
 Requires the server to be running with TLS on the given port. Tests `REGISTER`,
-`LOGIN`, `DEPOSIT`, `BALANCE`, `HISTORY`, and bad-password rejection over TLS.
+`LOGIN`, `DEPOSIT`, `BALANCE`, `HISTORY`, bad-password rejection, and rejection
+of a certificate signed by an unrelated CA.
 
 ```
 RESULT: PASS – TLS handshake + REGISTER + DEPOSIT + BALANCE + bad-auth all OK
@@ -348,6 +349,10 @@ void    vn_close   (VNConn *c);
 
 When `ssl == NULL`, these use plain `read()`/`write()`. Supplying certificate and
 key paths starts the server in TLS mode; otherwise the port serves plaintext.
+The TLS client verifies the server certificate and host name by default. Use
+`--cafile vaultnet.crt` for the generated development certificate, or omit it
+to use the system trust store. `--insecure` disables verification explicitly
+and prints a warning; it is intended only for local testing.
 
 ---
 
@@ -407,7 +412,5 @@ Two GitHub Actions jobs on every push to `main`:
 - **Single WAL file**: suitable for a single-node server; no replication.
 - **fsync bottleneck**: each acknowledged mutation waits for WAL durability;
   batching reduces the number of syncs when independent operations overlap.
-- **TLS peer verification disabled on client**: `tls_client_ctx(0)` uses `SSL_VERIFY_NONE`
-  — appropriate for a dev certificate; production use should verify the server's cert chain.
 - **Max accounts**: compile-time constant `MAX_ACCOUNTS` (default 2048) in `protocol.h`.
 - **HISTORY**: scans the audit log linearly; scales to ~50 k entries before becoming slow.

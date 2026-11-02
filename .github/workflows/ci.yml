@@ -35,7 +35,7 @@ jobs:
           ./bin/vaultnet_server 18080 vaultnet.crt vaultnet.key &
           SRV=$!
           sleep 1
-          bash tests/tls_smoke.sh 18080
+          bash tests/tls_smoke.sh 18080 vaultnet.crt
           kill $SRV 2>/dev/null || true
           wait $SRV 2>/dev/null || true
           rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock vaultnet.crt vaultnet.key

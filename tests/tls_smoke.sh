@@ -6,6 +6,7 @@
 set -uo pipefail
 
 PORT="${1:-18080}"
+CAFILE="${2:-vaultnet.crt}"
 HOST="127.0.0.1"
 CLIENT="./bin/vaultnet_client"
 
@@ -13,7 +14,7 @@ tls_cmd() {
     # Pipe a newline-separated command script through the TLS client.
     # The client prints "> " prompts inline with "< RESPONSE" on the same stdout line
     # ("> < OK ..."), so strip the "> " prefix before grepping for "< ".
-    printf '%s\nQUIT\n' "$1" | "$CLIENT" "$HOST" "$PORT" --tls 2>/dev/null \
+    printf '%s\nQUIT\n' "$1" | "$CLIENT" "$HOST" "$PORT" --tls --cafile "$CAFILE" 2>/dev/null \
         | sed 's/^> //' | grep '^< ' | sed 's/^< //'
 }
 
@@ -45,5 +46,17 @@ if ! echo "$OUT" | grep -q "^ERR"; then
     exit 1
 fi
 
+# A different trust anchor must not authenticate the server.
+WRONG_CA_DIR=$(mktemp -d)
+trap 'rm -rf "$WRONG_CA_DIR"' EXIT
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$WRONG_CA_DIR/wrong.key" -out "$WRONG_CA_DIR/wrong.crt" \
+    -subj '/CN=wrong-vaultnet-ca' >/dev/null 2>&1
+if printf 'QUIT\n' | "$CLIENT" "$HOST" "$PORT" --tls \
+        --cafile "$WRONG_CA_DIR/wrong.crt" >"$WRONG_CA_DIR/client.log" 2>&1; then
+    echo "  RESULT: FAIL – client accepted an unrelated CA"
+    exit 1
+fi
+
 echo "────────────────────────────────────────────"
-echo "  RESULT: PASS – TLS handshake + REGISTER + DEPOSIT + BALANCE + bad-auth all OK"
+echo "  RESULT: PASS – verified TLS, banking commands, bad-auth, and wrong-CA rejection"
