@@ -257,6 +257,7 @@ ASAN_OPTIONS="halt_on_error=1 detect_leaks=1" ./bin/vaultnet_server_asan 18080 &
 make bench
 # or manually:
 ./bin/vaultnet_loadgen -h 127.0.0.1 -p 18080 -t 12 -c 16 -w 2
+./bin/vaultnet_loadgen -h 127.0.0.1 -p 18080 -t 8 -c 32 -w 1 -m -L
 ```
 
 Flags:
@@ -268,32 +269,48 @@ Flags:
 | `-t SECS` | `10` | Test duration in seconds |
 | `-c CONNS` | `8` | Number of concurrent connections |
 | `-w WARM` | `2` | Warm-up period in seconds (excluded from stats) |
+| `-m` | off | Mix deposit, withdraw, transfer, and balance requests |
+| `-L` | off | Log in once per connection; time transactions only |
 
-Each worker registers once, then loops `LOGIN → DEPOSIT 1 → LOGOUT`.
-Latency is tracked per-operation using `clock_gettime(CLOCK_MONOTONIC)`.
+`make bench` uses `-m -L`. Each worker registers and seeds one account before
+timing starts. The mixed workload selects among four commands; `-L` keeps the
+session logged in, so PBKDF2 is outside the measured transaction latency.
+Latency uses `clock_gettime(CLOCK_MONOTONIC)`.
 
-Example from a local 12-second run with 16 connections:
+Measured locally on 2 November 2026, with 8-second runs and a 1-second warm-up:
 
-```
-Throughput         : 750.3 ops/sec
-Latency  p50       : 19661 µs
-Latency  p95       : 33831 µs
-Latency  p99       : 41281 µs
-Latency  max       : 56010 µs
-```
+| Machine/CPU | Disk | Connections | Ops/sec | p50 (µs) | p99 (µs) | Avg WAL batch |
+|---|---|---:|---:|---:|---:|---:|
+| MacBook Pro, Apple M3 Pro | Internal Apple SSD AP0512Z | 1 | 27,685.6 | 46 | 67 | 1.00 |
+| MacBook Pro, Apple M3 Pro | Internal Apple SSD AP0512Z | 8 | 64,264.8 | 119 | 347 | 1.76 |
+| MacBook Pro, Apple M3 Pro | Internal Apple SSD AP0512Z | 32 | 41,044.6 | 669 | 2,500 | 3.41 |
+| MacBook Pro, Apple M3 Pro | Internal Apple SSD AP0512Z | 64 | 34,906.7 | 1,579 | 6,258 | 10.25 |
 
-The figures above were measured before the PBKDF2 work factor changed from
-100,000 to 600,000 iterations. Each acknowledged write waits for a WAL `fsync()`.
-Independent account mutations
-can now queue records concurrently, and the WAL writer reports records, `fsync`
-calls, and average batch size on shutdown. In an 8-second local run on an Apple
-M3 Pro with internal SSD, the old lock design had a 1.00 average batch at 64
-connections; the new design measured 1.25. The current benchmark logs in for
-every transaction, so PBKDF2 work still limits throughput (721.0 before and
-675.3 ops/sec after in those runs). With checkpoints moved to a background
-worker, a repeat at 64 connections measured 702.2 ops/sec and a maximum
-latency of 259,992 µs versus 332,613 µs with request-path checkpoints.
-These are observations from one run each.
+The WAL batch figure includes registration, seeding, warm-up, and measurement.
+Throughput rose from 1 to 8 connections and fell at 32 and 64 on this machine;
+larger batches alone did not make the workload scale linearly. Every acknowledged
+write still waits for a durable WAL `fsync()`.
+
+Before/after task 1 comparison on the same machine and SSD, with the old
+`LOGIN → DEPOSIT → LOGOUT` benchmark and 100,000 PBKDF2 iterations. Each run
+used 8 seconds with a 1-second warm-up; that load generator version reported a
+6-second measurement window due to a timing bug fixed in task 7. These rows
+are comparable to each other, not to the mixed workload above.
+
+| Lock design | Connections | Ops/sec | p50 (µs) | p99 (µs) | Avg WAL batch |
+|---|---:|---:|---:|---:|---:|
+| Before task 1 | 1 | 101.7 | 9,718 | 10,614 | 1.00 |
+| After task 1 | 1 | 98.6 | 10,151 | 10,700 | 1.00 |
+| Before task 1 | 8 | 571.6 | 13,225 | 28,661 | 1.00 |
+| After task 1 | 8 | 571.0 | 13,377 | 25,777 | 1.01 |
+| Before task 1 | 32 | 704.4 | 44,525 | 96,255 | 1.00 |
+| After task 1 | 32 | 676.4 | 45,815 | 106,486 | 1.14 |
+| Before task 1 | 64 | 721.0 | 85,744 | 198,242 | 1.00 |
+| After task 1 | 64 | 675.3 | 95,274 | 213,792 | 1.25 |
+
+Moving checkpointing off the request path in task 2 reduced the maximum latency
+at 64 connections from 332,613 to 259,992 µs in one additional run. These
+single-run measurements show the observed direction, not a guaranteed speedup.
 
 ---
 

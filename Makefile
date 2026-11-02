@@ -133,7 +133,7 @@ bench: server loadgen
 	  (cd "$$work_dir" && "$$server_bin" $(DEFAULT_PORT)) & server_pid=$$!; \
 	  trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$work_dir"' EXIT; \
 	  sleep 0.8; \
-	  $(LOADGEN_BIN) -h 127.0.0.1 -p $(DEFAULT_PORT) -t 12 -c 16 -w 2
+	  $(LOADGEN_BIN) -h 127.0.0.1 -p $(DEFAULT_PORT) -t 12 -c 16 -w 2 -m -L
 
 # gen-cert: generate a self-signed dev certificate (valid 10 years)
 gen-cert:

@@ -7,6 +7,8 @@
  *   -t SECS    duration   (default 10)
  *   -c CONNS   concurrent connections / threads (default 8)
  *   -w WARM    warm-up seconds discarded from results (default 2)
+ *   -m         mixed deposit/withdraw/transfer/balance workload
+ *   -L         log in once per connection (transaction-only timing)
  *
  * Each thread: register once, then loop:
  *   LOGIN → DEPOSIT 1 → LOGOUT
@@ -87,13 +89,17 @@ static int send_cmd(int fd, const char *cmd) {
     return (write(fd, buf, (size_t)n) == n) ? 0 : -1;
 }
 
-/* Send cmd, read reply, return 1 if reply starts with "OK", else 0 */
-static int cmd_ok(int fd, const char *cmd) {
+/* Return 1=OK, 0=ERR, -1=transport failure. */
+static int cmd_status(int fd, const char *cmd) {
     char reply[BUF_SZ];
-    if (send_cmd(fd, cmd) < 0) return 0;
-    if (read_line(fd, reply, sizeof(reply)) < 0) return 0;
-    return strncmp(reply, "OK", 2) == 0;
+    if (send_cmd(fd, cmd) < 0) return -1;
+    if (read_line(fd, reply, sizeof(reply)) < 0) return -1;
+    if (strncmp(reply, "OK", 2) == 0) return 1;
+    if (strncmp(reply, "ERR", 3) == 0) return 0;
+    return -1;
 }
+
+static int cmd_ok(int fd, const char *cmd) { return cmd_status(fd, cmd) == 1; }
 
 /* ── comparison for qsort ────────────────────────────────────────────────── */
 
@@ -109,7 +115,9 @@ typedef struct {
     const char *host;
     int         port;
     int         id;          /* thread index */
-    int         total_secs;
+    int         conns;
+    int         mixed;
+    int         prelogged;
     int         warm_secs;
     /* results written by thread */
     uint64_t   *latencies;   /* µs per LOGIN..LOGOUT round trip */
@@ -118,7 +126,8 @@ typedef struct {
     int         error;       /* non-zero if thread failed */
 } WorkerArgs;
 
-static volatile int g_start = 0;   /* set to 1 when all threads should start */
+static _Atomic int  g_start = 0;
+static _Atomic int  g_ready = 0;
 static _Atomic int  g_stop  = 0;   /* set to 1 when time is up */
 
 /* ── worker thread ───────────────────────────────────────────────────────── */
@@ -132,22 +141,30 @@ static void *worker(void *arg) {
     snprintf(pass, sizeof(pass), "bench_pw_%d", w->id);
 
     int fd = tcp_connect(w->host, w->port);
-    if (fd < 0) { w->error = 1; return NULL; }
+    if (fd < 0) {
+        w->error = 1;
+        atomic_fetch_add(&g_ready, 1);
+        return NULL;
+    }
 
     char buf[BUF_SZ];
-    /* consume the welcome line */
-    read_line(fd, buf, sizeof(buf));
-
     snprintf(cmd, sizeof(cmd), "REGISTER %s %s", user, pass);
-    send_cmd(fd, cmd);
-    read_line(fd, buf, sizeof(buf));  /* ignore dup error on restart */
+    int setup_ok = read_line(fd, buf, sizeof(buf)) == 0 &&
+                   cmd_ok(fd, cmd);
+    snprintf(cmd, sizeof(cmd), "LOGIN %s %s", user, pass);
+    setup_ok = setup_ok && cmd_ok(fd, cmd) &&
+               cmd_ok(fd, "DEPOSIT 1000") && cmd_ok(fd, "LOGOUT");
     send_cmd(fd, "QUIT");
     read_line(fd, buf, sizeof(buf));
     close(fd);
+    if (!setup_ok) {
+        w->error = 1;
+        atomic_fetch_add(&g_ready, 1);
+        return NULL;
+    }
 
-    /* Spin-wait for the start signal */
-    while (!g_start)
-        ;
+    atomic_fetch_add(&g_ready, 1);
+    while (!atomic_load(&g_start)) usleep(1000);
 
     uint64_t t_thread_start = now_us();
     uint64_t warm_end = t_thread_start + (uint64_t)w->warm_secs * 1000000ULL;
@@ -156,22 +173,51 @@ static void *worker(void *arg) {
 
     /* Persistent connection: re-connect on error */
     fd = -1;
+    int logged_in = 0;
+    unsigned rng = (unsigned)getpid() ^ (unsigned)w->id * 2654435761u;
 
     while (!atomic_load(&g_stop)) {
         if (fd < 0) {
             fd = tcp_connect(w->host, w->port);
             if (fd < 0) { usleep(1000); continue; }
-            read_line(fd, buf, sizeof(buf)); /* welcome */
+            if (read_line(fd, buf, sizeof(buf)) != 0) {
+                close(fd); fd = -1; continue;
+            }
+            logged_in = 0;
         }
 
+        if (w->prelogged && !logged_in) {
+            snprintf(cmd, sizeof(cmd), "LOGIN %s %s", user, pass);
+            if (!cmd_ok(fd, cmd)) { close(fd); fd = -1; continue; }
+            logged_in = 1;
+        }
         uint64_t t0 = now_us();
 
-        snprintf(cmd, sizeof(cmd), "LOGIN %s %s", user, pass);
-        if (!cmd_ok(fd, cmd)) { close(fd); fd = -1; continue; }
+        if (!w->prelogged) {
+            snprintf(cmd, sizeof(cmd), "LOGIN %s %s", user, pass);
+            if (!cmd_ok(fd, cmd)) { close(fd); fd = -1; continue; }
+        }
 
-        if (!cmd_ok(fd, "DEPOSIT 1")) { close(fd); fd = -1; continue; }
+        if (!w->mixed) {
+            strcpy(cmd, "DEPOSIT 1");
+        } else {
+            int kind = (int)(rand_r(&rng) % 4);
+            if (kind == 0) strcpy(cmd, "DEPOSIT 1");
+            else if (kind == 1) strcpy(cmd, "WITHDRAW 1");
+            else if (kind == 2 && w->conns > 1) {
+                int target = (w->id + 1 + (int)(rand_r(&rng) % (unsigned)(w->conns - 1)))
+                             % w->conns;
+                snprintf(cmd, sizeof(cmd), "TRANSFER bench_%d_%d 1",
+                         target, (int)getpid());
+            } else strcpy(cmd, "BALANCE");
+        }
+        int status = cmd_status(fd, cmd);
+        if (status < 0) { close(fd); fd = -1; continue; }
 
-        if (!cmd_ok(fd, "LOGOUT")) { close(fd); fd = -1; continue; }
+        if (!w->prelogged && !cmd_ok(fd, "LOGOUT")) {
+            close(fd); fd = -1; continue;
+        }
+        if (status == 0) continue;
 
         uint64_t lat = now_us() - t0;
 
@@ -211,31 +257,35 @@ int main(int argc, char *argv[]) {
     int secs  = DEFAULT_SECS;
     int conns = DEFAULT_CONNS;
     int warm  = DEFAULT_WARM;
+    int mixed = 0, prelogged = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "h:p:t:c:w:")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:t:c:w:mL")) != -1) {
         switch (opt) {
         case 'h': host  = optarg;      break;
         case 'p': port  = atoi(optarg); break;
         case 't': secs  = atoi(optarg); break;
         case 'c': conns = atoi(optarg); break;
         case 'w': warm  = atoi(optarg); break;
+        case 'm': mixed = 1; break;
+        case 'L': prelogged = 1; break;
         default:
             fprintf(stderr, "usage: %s [-h host] [-p port] [-t secs] "
-                            "[-c conns] [-w warm_secs]\n", argv[0]);
+                            "[-c conns] [-w warm_secs] [-m] [-L]\n", argv[0]);
             return 1;
         }
     }
 
-    if (warm >= secs) {
+    if (warm >= secs || warm < 0 || secs < 1 || conns < 1 || conns > 256) {
         fprintf(stderr, "warm-up (%ds) must be < total duration (%ds)\n",
                 warm, secs);
         return 1;
     }
 
     printf("VaultNet loadgen: host=%s port=%d duration=%ds "
-           "connections=%d warm-up=%ds\n",
-           host, port, secs, conns, warm);
+           "connections=%d warm-up=%ds workload=%s session=%s\n",
+           host, port, secs, conns, warm,
+           mixed ? "mixed" : "deposit", prelogged ? "prelogged" : "login-per-op");
 
     /* Allocate per-thread state */
     WorkerArgs *args   = calloc((size_t)conns, sizeof(WorkerArgs));
@@ -250,7 +300,9 @@ int main(int argc, char *argv[]) {
         args[i].host       = host;
         args[i].port       = port;
         args[i].id         = i;
-        args[i].total_secs = secs;
+        args[i].conns      = conns;
+        args[i].mixed      = mixed;
+        args[i].prelogged  = prelogged;
         args[i].warm_secs  = warm;
         args[i].latencies  = lats[i];
     }
@@ -259,13 +311,22 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < conns; i++)
         pthread_create(&tids[i], NULL, worker, &args[i]);
 
-    /* Give threads a moment to register and reach the spin loop */
-    sleep(1);
+    /* Keep registration and seeding outside the timed workload. */
+    while (atomic_load(&g_ready) < conns) usleep(1000);
+    for (int i = 0; i < conns; i++) {
+        if (args[i].error) {
+            fprintf(stderr, "worker %d failed during setup\n", i);
+            atomic_store(&g_start, 1);
+            atomic_store(&g_stop, 1);
+            for (int j = 0; j < conns; j++) pthread_join(tids[j], NULL);
+            return 1;
+        }
+    }
 
     uint64_t t_start = now_us();
-    g_start = 1;
+    atomic_store(&g_start, 1);
 
-    sleep((unsigned)(secs - warm));
+    sleep((unsigned)secs);
     atomic_store(&g_stop, 1);
 
     for (int i = 0; i < conns; i++)
