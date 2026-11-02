@@ -186,7 +186,7 @@ int wal_init(const char *wal_path) {
     return 0;
 }
 
-void wal_shutdown(void) {
+int wal_shutdown(void) {
     pthread_mutex_lock(&g_qmtx);
     g_shutdown = 1;
     pthread_cond_signal(&g_work);
@@ -195,11 +195,13 @@ void wal_shutdown(void) {
     fprintf(stderr, "WAL stats: records=%" PRIu64 " fsyncs=%" PRIu64
             " avg_batch=%.2f\n", g_records_written, g_fsync_calls,
             g_fsync_calls ? (double)g_records_written / (double)g_fsync_calls : 0.0);
+    int rc = g_io_failed ? -1 : 0;
     if (g_wal_fd >= 0) {
-        fsync(g_wal_fd);
-        close(g_wal_fd);
+        if (fsync(g_wal_fd) < 0) { perror("wal_shutdown: fsync"); rc = -1; }
+        if (close(g_wal_fd) < 0) { perror("wal_shutdown: close"); rc = -1; }
         g_wal_fd = -1;
     }
+    return rc;
 }
 
 int wal_append(WALType type,
@@ -243,7 +245,7 @@ int wal_truncate(void) {
     pthread_mutex_unlock(&g_qmtx);
     if (ftruncate(g_wal_fd, 0) < 0) { perror("wal_truncate: ftruncate"); return -1; }
     if (lseek(g_wal_fd, 0, SEEK_SET) < 0) { perror("wal_truncate: lseek"); return -1; }
-    fsync(g_wal_fd);
+    if (fsync(g_wal_fd) < 0) { perror("wal_truncate: fsync"); return -1; }
     return 0;
 }
 
@@ -300,7 +302,11 @@ int wal_replay(const char *wal_path, uint64_t from_lsn) {
         valid_end += (off_t)sizeof(r);
         if (r.lsn <= from_lsn) { skipped++; continue; }
 
-        accounts_apply_wal_record(&r);
+        if (accounts_apply_wal_record(&r) != 0) {
+            fprintf(stderr, "WAL: invalid account reference or record at lsn %" PRIu64 "\n", r.lsn);
+            close(fd);
+            return -1;
+        }
         uint64_t prev = atomic_load_explicit(&g_last_lsn,
                                               memory_order_relaxed);
         while (r.lsn > prev &&

@@ -33,11 +33,14 @@
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <ctype.h>
 #include <openssl/crypto.h>
 
 /* ── global state ─────────────────────────────────────────────────────────── */
 
 static Account          g_accounts[MAX_ACCOUNTS];
+#define NAME_MAP_CAP 4096  /* power of two; at most half full */
+static int              g_name_slots[NAME_MAP_CAP]; /* account index + 1 */
 static int              g_num_accounts = 0;
 static uint64_t         g_next_id      = 1;
 static uint64_t         g_snap_lsn     = 0;  /* LSN at time of last snapshot */
@@ -137,19 +140,63 @@ static int sync_snapshot_directory(void) {
     int fd = open(dir, O_RDONLY);
     if (fd < 0) return -1;
     int rc = fsync(fd);
-    close(fd);
+    if (close(fd) < 0) rc = -1;
     return rc;
 }
 
 /* ── internal helpers ─────────────────────────────────────────────────────── */
 
 static Account *find_account_unlocked(const char *username) {
-    for (int i = 0; i < g_num_accounts; i++) {
-        Account *a = &g_accounts[i];
-        if (a->active && strncmp(a->username, username, MAX_USERNAME) == 0)
-            return a;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)username; *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    for (size_t i = 0; i < NAME_MAP_CAP; i++) {
+        int slot = g_name_slots[(hash + i) & (NAME_MAP_CAP - 1)];
+        if (!slot) return NULL;
+        Account *a = &g_accounts[slot - 1];
+        if (a->active && strcmp(a->username, username) == 0) return a;
     }
     return NULL;
+}
+
+/* Caller holds the registry write lock, or is in single-threaded startup. */
+static void index_account_unlocked(int index) {
+    const unsigned char *p = (const unsigned char *)g_accounts[index].username;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (; *p; p++) { hash ^= *p; hash *= UINT64_C(1099511628211); }
+    for (size_t i = 0; i < NAME_MAP_CAP; i++) {
+        size_t pos = (hash + i) & (NAME_MAP_CAP - 1);
+        if (!g_name_slots[pos]) { g_name_slots[pos] = index + 1; return; }
+    }
+}
+
+static int valid_hex(const char *s, size_t len) {
+    if (strlen(s) != len) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f'))) return 0;
+    return 1;
+}
+
+static int valid_credential_fields(const char *user, const char *hash,
+                                   const char *salt) {
+    size_t n = strlen(user);
+    if (n < MIN_USERNAME_LEN || n > MAX_USERNAME_LEN ||
+        !valid_hex(salt, SALT_HEX_LEN - 1)) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!((user[i] >= 'A' && user[i] <= 'Z') ||
+              (user[i] >= 'a' && user[i] <= 'z') ||
+              (user[i] >= '0' && user[i] <= '9') || user[i] == '_')) return 0;
+    if (strncmp(hash, "pbkdf2_sha256$", 14) == 0) {
+        const char *digits = hash + 14, *end = strchr(digits, '$');
+        if (!end || end == digits || (size_t)(end - digits) > 7) return 0;
+        for (const char *p = digits; p < end; p++) if (!isdigit((unsigned char)*p)) return 0;
+        long iterations = strtol(digits, NULL, 10);
+        return iterations >= 1 && iterations <= 10000000 && valid_hex(end + 1, 64);
+    }
+    return valid_hex(hash, 64);
 }
 
 static Account *find_by_id_unlocked(uint64_t id) {
@@ -192,7 +239,7 @@ static int checkpoint_locked(void) {
 
     if (fflush(fp) != 0) { fclose(fp); return -1; }
     if (fsync(fd)   != 0) { fclose(fp); return -1; }
-    fclose(fp);
+    if (fclose(fp) != 0) return -1;
 
     if (rename(tmp, g_snap_file) < 0) { perror("checkpoint: rename"); return -1; }
     if (sync_snapshot_directory() < 0) {
@@ -219,52 +266,64 @@ static int load_snapshot(void) {
         return -1;
     }
 
-    char line[MAX_LINE];
-    /* First line: header */
-    if (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#') {
-            /* # VaultNet snapshot lsn=<N> count=<M> */
-            uint64_t lsn = 0;
-            sscanf(line, "# VaultNet snapshot lsn=%" SCNu64, &lsn);
-            g_snap_lsn = lsn;
-        } else {
-            /* Legacy format without header — rewind */
-            rewind(fp);
-        }
-    }
+    char line[MAX_LINE], extra;
+    unsigned count;
+    uint64_t lsn;
+    if (!fgets(line, sizeof(line), fp) || !strchr(line, '\n') ||
+        sscanf(line, "# VaultNet snapshot lsn=%" SCNu64 " count=%u %c",
+               &lsn, &count, &extra) != 2 || count > MAX_ACCOUNTS) goto corrupt;
+    char canonical[MAX_LINE];
+    int header_len = snprintf(canonical, sizeof(canonical),
+                              "# VaultNet snapshot lsn=%" PRIu64 " count=%u\n",
+                              lsn, count);
+    if (header_len < 0 || header_len >= (int)sizeof(canonical) ||
+        strcmp(line, canonical) != 0) goto corrupt;
+    g_snap_lsn = lsn;
 
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
         size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
-        if (g_num_accounts >= MAX_ACCOUNTS) {
-            fprintf(stderr, "load_snapshot: account limit reached\n");
-            break;
+        if (!len || line[len - 1] != '\n' || g_num_accounts >= (int)count)
+            goto corrupt;
+        line[len - 1] = '\0';
+        char *parts[5], *p = line;
+        for (int j = 0; j < 5; j++) {
+            parts[j] = strsep(&p, ":");
+            if (!parts[j]) goto corrupt;
         }
-
+        if (p || !valid_credential_fields(parts[1], parts[2], parts[3])) goto corrupt;
+        for (const char *q = parts[0]; *q; q++)
+            if (!isdigit((unsigned char)*q)) goto corrupt;
+        for (const char *q = parts[4]; *q; q++)
+            if (!isdigit((unsigned char)*q)) goto corrupt;
+        char *end;
+        errno = 0;
+        uint64_t id = strtoull(parts[0], &end, 10);
+        if (errno || end == parts[0] || *end || !id || id == UINT64_MAX) goto corrupt;
+        errno = 0;
+        int64_t balance = strtoll(parts[4], &end, 10);
+        if (errno || end == parts[4] || *end || balance < 0 ||
+            find_account_unlocked(parts[1]) || find_by_id_unlocked(id)) goto corrupt;
         Account *a = &g_accounts[g_num_accounts];
         memset(a, 0, sizeof(*a));
-        char *p = line, *tok;
-
-        tok = strsep(&p, ":"); if (!tok) continue;
-        a->account_id = (uint64_t)strtoull(tok, NULL, 10);
-        tok = strsep(&p, ":"); if (!tok) continue;
-        copy_bounded(a->username, sizeof(a->username), tok);
-        tok = strsep(&p, ":"); if (!tok) continue;
-        copy_bounded(a->password_hash, sizeof(a->password_hash), tok);
-        tok = strsep(&p, ":"); if (!tok) continue;
-        copy_bounded(a->salt, sizeof(a->salt), tok);
-        tok = strsep(&p, ":"); if (!tok) continue;
-        a->balance_paise = (int64_t)strtoll(tok, NULL, 10);
-
+        a->account_id = id;
+        copy_bounded(a->username, sizeof(a->username), parts[1]);
+        copy_bounded(a->password_hash, sizeof(a->password_hash), parts[2]);
+        copy_bounded(a->salt, sizeof(a->salt), parts[3]);
+        a->balance_paise = balance;
+        if (pthread_mutex_init(&a->lock, NULL) != 0) goto corrupt;
         a->active = 1;
-        pthread_mutex_init(&a->lock, NULL);
-        if (a->account_id >= g_next_id)
-            g_next_id = a->account_id + 1;
+        index_account_unlocked(g_num_accounts);
+        if (id >= g_next_id) g_next_id = id + 1;
         g_num_accounts++;
     }
-    fclose(fp);
+    if (ferror(fp) || g_num_accounts != (int)count) goto corrupt;
+    if (fclose(fp) != 0) return -1;
     return 0;
+
+corrupt:
+    fprintf(stderr, "load_snapshot: invalid snapshot %s\n", g_snap_file);
+    fclose(fp);
+    return -1;
 }
 
 /* ── lifecycle ─────────────────────────────────────────────────────────────── */
@@ -275,6 +334,7 @@ int accounts_init(const char *snap_file) {
     g_num_accounts = 0;
     g_next_id = 1;
     g_snap_lsn = 0;
+    memset(g_name_slots, 0, sizeof(g_name_slots));
     atomic_store(&g_op_count, 0);
     copy_bounded(g_snap_file, sizeof(g_snap_file), snap_file);
     memset(g_accounts, 0, sizeof(g_accounts));
@@ -285,9 +345,9 @@ uint64_t accounts_snap_lsn(void) {
     return g_snap_lsn;
 }
 
-void accounts_shutdown(void) {
+int accounts_shutdown(void) {
     accounts_checkpoint_stop();
-    accounts_checkpoint();
+    int rc = accounts_checkpoint();
 
     pthread_rwlock_wrlock(&g_reg_rwlock);
     for (int i = 0; i < g_num_accounts; i++) {
@@ -298,6 +358,7 @@ void accounts_shutdown(void) {
     }
     g_num_accounts = 0;
     pthread_rwlock_unlock(&g_reg_rwlock);
+    return rc;
 }
 
 /* ── checkpoint trigger ───────────────────────────────────────────────────── */
@@ -314,13 +375,21 @@ static void maybe_checkpoint(void) {
 
 /* ── WAL record application (used during replay) ─────────────────────────── */
 
-void accounts_apply_wal_record(const WALRecord *r) {
+int accounts_apply_wal_record(const WALRecord *r) {
+    if (strnlen(r->username1, sizeof(r->username1)) == sizeof(r->username1) ||
+        strnlen(r->username2, sizeof(r->username2)) == sizeof(r->username2))
+        return -1;
     switch ((WALType)r->type) {
 
     case WAL_REGISTER: {
-        if (g_num_accounts >= MAX_ACCOUNTS) break;
-        /* Skip if this account_id is already in memory (e.g., from snapshot) */
-        if (find_by_id_unlocked(r->account_id)) break;
+        if (g_num_accounts >= MAX_ACCOUNTS || !r->account_id ||
+            r->account_id == UINT64_MAX ||
+            strnlen(r->username1, sizeof(r->username1)) == sizeof(r->username1) ||
+            strnlen(r->password_hash, sizeof(r->password_hash)) == sizeof(r->password_hash) ||
+            strnlen(r->salt, sizeof(r->salt)) == sizeof(r->salt) ||
+            !valid_credential_fields(r->username1, r->password_hash, r->salt) ||
+            find_by_id_unlocked(r->account_id) ||
+            find_account_unlocked(r->username1)) return -1;
         Account *a = &g_accounts[g_num_accounts];
         memset(a, 0, sizeof(*a));
         a->account_id = r->account_id;
@@ -328,46 +397,50 @@ void accounts_apply_wal_record(const WALRecord *r) {
         copy_bounded(a->password_hash, sizeof(a->password_hash), r->password_hash);
         copy_bounded(a->salt, sizeof(a->salt), r->salt);
         a->balance_paise = 0;
+        if (pthread_mutex_init(&a->lock, NULL) != 0) return -1;
         a->active = 1;
-        pthread_mutex_init(&a->lock, NULL);
+        index_account_unlocked(g_num_accounts);
         if (a->account_id >= g_next_id)
             g_next_id = a->account_id + 1;
         g_num_accounts++;
-        break;
+        return 0;
     }
 
     case WAL_DEPOSIT:
     case WAL_WITHDRAW: {
         Account *a = find_account_unlocked(r->username1);
-        if (a) a->balance_paise = r->bal1_after;
-        break;
+        if (!a || a->account_id != r->account_id ||
+            r->bal1_after < 0 || r->amount_paise <= 0) return -1;
+        a->balance_paise = r->bal1_after;
+        return 0;
     }
 
     case WAL_TRANSFER: {
         Account *src = find_account_unlocked(r->username1);
         Account *dst = find_account_unlocked(r->username2);
-        if (src) src->balance_paise = r->bal1_after;
-        if (dst) dst->balance_paise = r->bal2_after;
-        break;
+        if (!src || !dst || src == dst || src->account_id != r->account_id ||
+            r->bal1_after < 0 || r->bal2_after < 0 ||
+            r->amount_paise <= 0) return -1;
+        src->balance_paise = r->bal1_after;
+        dst->balance_paise = r->bal2_after;
+        return 0;
     }
     }
+    return -1;
 }
 
 /* ── public operations ────────────────────────────────────────────────────── */
 
 int accounts_register(const char *username, const char *password) {
+    char salt[SALT_HEX_LEN], hash[MAX_HASH];
+    /* PBKDF2 is intentionally outside the registry write lock. Concurrent
+     * registrations may derive hashes while balance operations proceed. */
+    if (generate_salt(salt, sizeof(salt)) != 0 ||
+        hash_password(password, salt, hash, sizeof(hash)) != 0) return -1;
     pthread_rwlock_rdlock(&g_ckpt_rwlock);
     pthread_rwlock_wrlock(&g_reg_rwlock);
 
-    for (int i = 0; i < g_num_accounts; i++) {
-        if (g_accounts[i].active &&
-            strncmp(g_accounts[i].username, username, MAX_USERNAME) == 0) {
-            pthread_rwlock_unlock(&g_reg_rwlock);
-            pthread_rwlock_unlock(&g_ckpt_rwlock);
-            return -1;
-        }
-    }
-    if (g_num_accounts >= MAX_ACCOUNTS) {
+    if (find_account_unlocked(username) || g_num_accounts >= MAX_ACCOUNTS) {
         pthread_rwlock_unlock(&g_reg_rwlock);
         pthread_rwlock_unlock(&g_ckpt_rwlock);
         return -1;
@@ -377,13 +450,8 @@ int accounts_register(const char *username, const char *password) {
     memset(a, 0, sizeof(*a));
     a->account_id    = g_next_id;
     copy_bounded(a->username, sizeof(a->username), username);
-    if (generate_salt(a->salt, sizeof(a->salt)) != 0 ||
-        hash_password(password, a->salt, a->password_hash,
-                      sizeof(a->password_hash)) != 0) {
-        pthread_rwlock_unlock(&g_reg_rwlock);
-        pthread_rwlock_unlock(&g_ckpt_rwlock);
-        return -1;
-    }
+    copy_bounded(a->salt, sizeof(a->salt), salt);
+    copy_bounded(a->password_hash, sizeof(a->password_hash), hash);
     a->balance_paise = 0;
     pthread_mutex_init(&a->lock, NULL);
 
@@ -393,6 +461,7 @@ int accounts_register(const char *username, const char *password) {
                         0, 0, 0);
     if (rc == 0) {
         a->active = 1;
+        index_account_unlocked(g_num_accounts);
         g_num_accounts++;
         g_next_id++;
     } else {

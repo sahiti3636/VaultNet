@@ -62,8 +62,8 @@ int  accounts_checkpoint_start(void);
 /* Stop without a final checkpoint (used by the in-process crash test). */
 void accounts_checkpoint_stop(void);
 
-/* Call at shutdown: final persist + destroy per-account mutexes. */
-void accounts_shutdown(void);
+/* Call at shutdown: final persist + destroy per-account mutexes. Returns -1 on checkpoint error. */
+int accounts_shutdown(void);
 
 /* ---------- operations (all locking handled internally) ---------- */
 
@@ -114,6 +114,6 @@ int accounts_transfer(const char *src_user, const char *dst_user,
  * Apply a single WAL record to the in-memory account store.
  * Called by wal_replay() during single-threaded startup; no locking needed.
  */
-void accounts_apply_wal_record(const WALRecord *r);
+int accounts_apply_wal_record(const WALRecord *r);
 
 #endif /* ACCOUNTS_H */

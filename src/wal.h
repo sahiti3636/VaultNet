@@ -56,7 +56,7 @@ int  wal_init(const char *wal_path);
 /*
  * wal_shutdown: flush all pending records, fsync, and stop the writer thread.
  */
-void wal_shutdown(void);
+int wal_shutdown(void);
 
 /*
  * wal_append: enqueue a record and block until it is durable (fsynced).

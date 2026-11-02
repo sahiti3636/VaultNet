@@ -577,8 +577,8 @@ int main(int argc, char *argv[]) {
     if (g_pipe[1]   >= 0) { close(g_pipe[1]);   g_pipe[1]   = -1; }
 
     threadpool_destroy(&g_pool);
-    accounts_shutdown();
-    wal_shutdown();
+    int persistence_ok = accounts_shutdown() == 0;
+    if (wal_shutdown() != 0) persistence_ok = 0;
     audit_log("SERVER", "system", "shutdown", 0, "OK");
     audit_close();
 
@@ -589,6 +589,7 @@ int main(int argc, char *argv[]) {
 
     release_lockfile();
 
-    fprintf(stdout, "VaultNet shut down cleanly.\n");
-    return 0;
+    if (!persistence_ok) fprintf(stderr, "VaultNet shutdown: persistence failed\n");
+    else fprintf(stdout, "VaultNet shut down cleanly.\n");
+    return persistence_ok ? 0 : 1;
 }

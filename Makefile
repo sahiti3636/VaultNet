@@ -163,4 +163,5 @@ clean:
 	    vaultnet.snap vaultnet.snap.tmp \
 	    vaultnet.wal \
 	    vaultnet_audit.log vaultnet.lock \
+	    vaultnet.crt vaultnet.key \
 	    /tmp/vaultnet_unit.snap /tmp/vaultnet_unit.wal

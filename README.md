@@ -16,7 +16,7 @@ optional TLS 1.2+, and a load generator with latency percentiles — all under `
 | **Transport** | Optional TLS 1.2+ via OpenSSL `VNConn` abstraction; plaintext fallback; `--tls` client flag |
 | **Precision** | Integer money in `int64_t` paise (1/100 of a unit) — no floating-point arithmetic |
 | **Networking** | epoll-based accept loop on Linux with self-pipe shutdown; `accept()`-loop fallback on macOS |
-| **Testing** | 37 unit tests, concurrency conservation proof, crash-recovery test, TLS smoke test, TSan + ASan builds |
+| **Testing** | 48 unit assertions, concurrency conservation proof, crash-recovery test, TLS smoke test, TSan + ASan builds |
 | **Load testing** | C load generator with p50/p95/p99/max latency reporting |
 
 ---
@@ -161,7 +161,7 @@ Example session:
 
 ## Testing
 
-### Unit tests (43 assertions)
+### Unit tests (48 assertions)
 
 ```bash
 make unit
@@ -170,8 +170,9 @@ make unit
 
 Covers: account register + auth, deposit/withdraw, transfer, balance reads,
 WAL crash recovery, double-restart recovery, a torn final WAL record, and a
-bad CRC in the middle of the WAL. Replay must stop and truncate at the last
-valid record.
+bad CRC in the middle of the WAL, malformed snapshots, and WAL references to
+unknown accounts. Torn or bad-CRC replay stops and truncates at the last valid
+record; a semantic WAL error fails startup.
 Uses `/tmp/vaultnet_unit.{snap,wal}` — no side effects in the project directory.
 
 ### Concurrency conservation test
@@ -358,6 +359,10 @@ Every successful balance mutation follows this sequence:
 On startup, the server replays any WAL records whose LSN exceeds the snapshot's
 checkpoint LSN, restoring all acknowledged operations after a crash.
 LSN tracking uses `_Atomic uint64_t g_last_lsn` (safe under TSan).
+Snapshot rows and headers are validated before use; invalid account references
+in replay fail startup. A registry-protected username hash table keeps account
+lookup bounded as the account count grows. Registration derives its password
+hash before acquiring the registry write lock.
 
 ### Password security
 
@@ -414,7 +419,7 @@ src/
   threadpool.c  Bounded circular-queue thread pool (64 workers, 256-slot queue)
 
 tests/
-  unit.c        43-assertion unit test suite (no server process required)
+  unit.c        48-assertion unit test suite (no server process required)
   loadgen.c     C load generator with latency percentiles
   crash_test.c  Concurrent crash recovery verifier
   crash_test.sh Builds and runs the C verifier
@@ -452,4 +457,5 @@ Two GitHub Actions jobs on every push to `main`:
 - **fsync bottleneck**: each acknowledged mutation waits for WAL durability;
   batching reduces the number of syncs when independent operations overlap.
 - **Max accounts**: compile-time constant `MAX_ACCOUNTS` (default 2048) in `protocol.h`.
-- **HISTORY**: scans the audit log linearly; scales to ~50 k entries before becoming slow.
+- **HISTORY**: scans at most 100,000 audit lines per request and returns at most
+  50 matching entries. Older entries can be omitted when the scan limit is reached.

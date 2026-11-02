@@ -278,6 +278,41 @@ static void test_wal_torn_and_corrupt(void) {
     shutdown_clean();
 }
 
+static void test_reject_invalid_persistence(void) {
+    printf("\n[invalid persistence]\n");
+    unlink(SNAP);
+    unlink(WAL);
+    FILE *fp = fopen(SNAP, "w");
+    if (!fp) { perror("snapshot test"); exit(2); }
+    fputs("# VaultNet snapshot lsn=1 count=1\n"
+          "1:alice:bad_hash:00112233445566778899aabbccddeeff:100\n", fp);
+    fclose(fp);
+    CHECK("malformed snapshot rejected", accounts_init(SNAP) != 0);
+    fp = fopen(SNAP, "w");
+    if (!fp) { perror("snapshot test"); exit(2); }
+    fputs("# VaultNet snapshot lsn=1 count=1\n"
+          "1:alice:203e5dceb257e1fb116834ff95166d913e163153e8d75824238029c020bdfcbf:00112233445566778899aabbccddeeff:-1\n", fp);
+    fclose(fp);
+    CHECK("negative snapshot balance rejected", accounts_init(SNAP) != 0);
+    fp = fopen(SNAP, "w");
+    if (!fp) { perror("snapshot test"); exit(2); }
+    fputs("# VaultNet snapshot lsn=1 count=2\n"
+          "1:alice:203e5dceb257e1fb116834ff95166d913e163153e8d75824238029c020bdfcbf:00112233445566778899aabbccddeeff:1\n"
+          "2:alice:203e5dceb257e1fb116834ff95166d913e163153e8d75824238029c020bdfcbf:00112233445566778899aabbccddeeff:1\n", fp);
+    fclose(fp);
+    CHECK("duplicate snapshot username rejected", accounts_init(SNAP) != 0);
+    unlink(SNAP);
+
+    init_fresh();
+    CHECK("unknown account WAL record appended",
+          wal_append(WAL_DEPOSIT, 999, "missing", NULL, NULL, NULL,
+                     100, 100, 0) == 0);
+    shutdown_crash();
+    CHECK("unknown account WAL replay rejected",
+          accounts_init(SNAP) == 0 && wal_replay(WAL, accounts_snap_lsn()) != 0);
+    unlink(WAL);
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -291,6 +326,7 @@ int main(void) {
     test_wal_crash_recovery();
     test_double_restart_recovery();
     test_wal_torn_and_corrupt();
+    test_reject_invalid_persistence();
 
     printf("\n===================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
