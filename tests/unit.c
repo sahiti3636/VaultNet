@@ -18,6 +18,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <sys/stat.h>
 
 /* ── test framework ───────────────────────────────────────────────────────── */
 
@@ -229,6 +232,52 @@ static void test_double_restart_recovery(void) {
     shutdown_clean();
 }
 
+static void test_wal_torn_and_corrupt(void) {
+    printf("\n[WAL torn tail and corrupt CRC]\n");
+    init_fresh();
+    accounts_register("alice", "alicepass");
+    int64_t bal = 0;
+    accounts_deposit("alice", 10000, &bal);
+    shutdown_crash();
+
+    struct stat st;
+    if (stat(WAL, &st) != 0) { perror("stat WAL"); exit(2); }
+    off_t valid_bytes = st.st_size;
+    int fd = open(WAL, O_WRONLY | O_APPEND);
+    WALRecord torn = {0};
+    if (fd < 0 || write(fd, &torn, sizeof(torn) / 2) !=
+                      (ssize_t)(sizeof(torn) / 2)) { perror("write torn WAL"); exit(2); }
+    close(fd);
+
+    reinit_after_crash();
+    CHECK("torn tail keeps valid balance",
+          accounts_get_balance("alice", &bal) == 0 && bal == 10000);
+    CHECK("torn tail truncated", stat(WAL, &st) == 0 && st.st_size == valid_bytes);
+    shutdown_clean();
+
+    init_fresh();
+    accounts_register("alice", "alicepass");
+    accounts_deposit("alice", 10000, &bal);
+    accounts_deposit("alice", 20000, &bal);
+    shutdown_crash();
+    fd = open(WAL, O_RDWR);
+    unsigned char byte;
+    off_t offset = (off_t)sizeof(WALRecord) + offsetof(WALRecord, amount_paise);
+    if (fd < 0 || pread(fd, &byte, 1, offset) != 1) { perror("read WAL"); exit(2); }
+    byte ^= 0x01;
+    if (pwrite(fd, &byte, 1, offset) != 1 || fsync(fd) != 0) {
+        perror("corrupt WAL"); exit(2);
+    }
+    close(fd);
+
+    reinit_after_crash();
+    CHECK("CRC error stops before corrupt record",
+          accounts_get_balance("alice", &bal) == 0 && bal == 0);
+    CHECK("CRC error truncates subsequent records",
+          stat(WAL, &st) == 0 && st.st_size == (off_t)sizeof(WALRecord));
+    shutdown_clean();
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -241,6 +290,7 @@ int main(void) {
     test_balance_read();
     test_wal_crash_recovery();
     test_double_restart_recovery();
+    test_wal_torn_and_corrupt();
 
     printf("\n===================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);

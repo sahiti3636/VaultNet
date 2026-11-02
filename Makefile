@@ -54,12 +54,13 @@ UNIT_BIN  := $(BINDIR)/vaultnet_unit
 
 LOADGEN_SRCS := tests/loadgen.c
 LOADGEN_BIN  := $(BINDIR)/vaultnet_loadgen
+CRASH_BIN    := $(BINDIR)/vaultnet_crash_test
 
 DEFAULT_PORT := 18080
 TLS_CERT     := vaultnet.crt
 TLS_KEY      := vaultnet.key
 
-.PHONY: all server client clean tsan asan unit check loadgen bench \
+.PHONY: all server client clean tsan asan unit check loadgen bench crash-test \
         gen-cert tls-smoke
 
 all: server client
@@ -111,6 +112,11 @@ $(UNIT_BIN): $(UNIT_SRCS) | $(BINDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) $(UNIT_SRCS) -o $@ $(LDFLAGS)
 
 loadgen: $(LOADGEN_BIN)
+
+crash-test: $(CRASH_BIN)
+
+$(CRASH_BIN): tests/crash_test.c | $(BINDIR)
+	$(CC) $(CFLAGS) tests/crash_test.c -o $@ $(LDFLAGS)
 
 $(LOADGEN_BIN): $(LOADGEN_SRCS) | $(BINDIR)
 	$(CC) $(CFLAGS) $(LOADGEN_SRCS) -o $@ $(LDFLAGS)

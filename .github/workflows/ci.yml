@@ -26,7 +26,7 @@ jobs:
         run: bash test_concurrency.sh
 
       - name: Crash recovery test
-        run: bash tests/crash_test.sh
+        run: CRASH_ITERS=5 bash tests/crash_test.sh
 
       - name: TLS smoke test
         run: |

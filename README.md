@@ -161,7 +161,7 @@ Example session:
 
 ## Testing
 
-### Unit tests (39 assertions)
+### Unit tests (43 assertions)
 
 ```bash
 make unit
@@ -169,7 +169,9 @@ make unit
 ```
 
 Covers: account register + auth, deposit/withdraw, transfer, balance reads,
-WAL crash recovery (simulated mid-write kill), and double-restart recovery.
+WAL crash recovery, double-restart recovery, a torn final WAL record, and a
+bad CRC in the middle of the WAL. Replay must stop and truncate at the last
+valid record.
 Uses `/tmp/vaultnet_unit.{snap,wal}` — no side effects in the project directory.
 
 ### Concurrency conservation test
@@ -192,8 +194,13 @@ RESULT: PASS – money conserved under 60 concurrent clients
 bash tests/crash_test.sh
 ```
 
-Performs a sequence of deposits, kills the server mid-way with `kill -9` (bypasses
-shutdown handler), restarts, and verifies every acknowledged operation survived.
+The C harness seeds 10 accounts, starts 16 clients making random deposits,
+withdrawals, and transfers, then sends `SIGKILL` at a random point during load.
+After restart, it checks all 10 balances against every acknowledged operation.
+Each client has at most one command in flight at the kill point; the verifier
+checks every possible applied/not-applied combination of those ambiguous
+commands. Transfers conserve the total in every combination. The local default
+is 20 iterations; CI runs 5 with `CRASH_ITERS=5`.
 
 ### TLS smoke test
 
@@ -378,9 +385,10 @@ src/
   threadpool.c  Bounded circular-queue thread pool (64 workers, 256-slot queue)
 
 tests/
-  unit.c        39-assertion unit test suite (no server process required)
+  unit.c        43-assertion unit test suite (no server process required)
   loadgen.c     C load generator with latency percentiles
-  crash_test.sh Crash recovery integration test
+  crash_test.c  Concurrent crash recovery verifier
+  crash_test.sh Builds and runs the C verifier
   tls_smoke.sh  TLS end-to-end smoke test
 
 gen_cert.sh     Self-signed dev certificate generator (10-year, localhost SANs)
