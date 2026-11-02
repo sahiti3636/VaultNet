@@ -56,6 +56,19 @@ int sendline_fd(int fd, const char *line) {
     return 0;
 }
 
+int drain_line_fd(int fd) {
+    char c;
+    for (;;) {
+        ssize_t rc = read(fd, &c, 1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (rc == 0) return -1;   /* EOF */
+        if (c == '\n') return 0;
+    }
+}
+
 int sendlinef(int fd, const char *fmt, ...) {
     char buf[MAX_LINE];
     va_list ap;

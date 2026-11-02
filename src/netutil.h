@@ -23,4 +23,12 @@ int sendline_fd(int fd, const char *line);
 int sendlinef(int fd, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
+/*
+ * Consume bytes from fd until a '\n' is found (or error/EOF).
+ * Use this after readline_fd fills its buffer without finding a newline,
+ * to discard the oversized line before reading the next command.
+ * Returns 0 on success, -1 on error/EOF.
+ */
+int drain_line_fd(int fd);
+
 #endif /* NETUTIL_H */
