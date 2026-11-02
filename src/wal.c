@@ -176,10 +176,6 @@ int wal_init(const char *wal_path) {
 
 void wal_shutdown(void) {
     pthread_mutex_lock(&g_qmtx);
-    if (g_io_failed || g_shutdown) {
-        pthread_mutex_unlock(&g_qmtx);
-        return -1;
-    }
     g_shutdown = 1;
     pthread_cond_signal(&g_work);
     pthread_mutex_unlock(&g_qmtx);

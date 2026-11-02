@@ -115,29 +115,26 @@ loadgen: $(LOADGEN_BIN)
 $(LOADGEN_BIN): $(LOADGEN_SRCS) | $(BINDIR)
 	$(CC) $(CFLAGS) $(LOADGEN_SRCS) -o $@ $(LDFLAGS)
 
-# bench: start a fresh server, run loadgen for 12s, shut down.
+# bench: run against an isolated data directory and stop only this server.
 bench: server loadgen
-	@pkill -f "vaultnet_server $(DEFAULT_PORT)" 2>/dev/null; sleep 0.2; true
-	@rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
-	$(SERVER_BIN) $(DEFAULT_PORT) &
-	@sleep 0.8
-	$(LOADGEN_BIN) -h 127.0.0.1 -p $(DEFAULT_PORT) -t 12 -c 16 -w 2
-	@pkill -f "vaultnet_server $(DEFAULT_PORT)" 2>/dev/null; true
-	@rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
+	@set -e; work_dir=$$(mktemp -d); server_bin="$$(pwd)/$(SERVER_BIN)"; \
+	  (cd "$$work_dir" && "$$server_bin" $(DEFAULT_PORT)) & server_pid=$$!; \
+	  trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$work_dir"' EXIT; \
+	  sleep 0.8; \
+	  $(LOADGEN_BIN) -h 127.0.0.1 -p $(DEFAULT_PORT) -t 12 -c 16 -w 2
 
 # gen-cert: generate a self-signed dev certificate (valid 10 years)
 gen-cert:
 	bash gen_cert.sh
 
-# tls-smoke: start server with TLS, run a quick smoke test, shut down
+# tls-smoke: run the TLS server in an isolated data directory.
 tls-smoke: server gen-cert
-	@pkill -f "vaultnet_server $(DEFAULT_PORT)" 2>/dev/null; sleep 0.2; true
-	@rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
-	$(SERVER_BIN) $(DEFAULT_PORT) $(TLS_CERT) $(TLS_KEY) &
-	@sleep 0.8
-	bash tests/tls_smoke.sh $(DEFAULT_PORT) $(TLS_CERT)
-	@pkill -f "vaultnet_server $(DEFAULT_PORT)" 2>/dev/null; true
-	@rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
+	@set -e; work_dir=$$(mktemp -d); server_bin="$$(pwd)/$(SERVER_BIN)"; \
+	  cert="$$(pwd)/$(TLS_CERT)"; key="$$(pwd)/$(TLS_KEY)"; \
+	  (cd "$$work_dir" && "$$server_bin" $(DEFAULT_PORT) "$$cert" "$$key") & server_pid=$$!; \
+	  trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$work_dir"' EXIT; \
+	  sleep 0.8; \
+	  bash tests/tls_smoke.sh $(DEFAULT_PORT)
 
 check: unit
 	@echo "--- unit tests ---"

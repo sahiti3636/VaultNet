@@ -6,3 +6,5 @@ obj/
 *.log
 *.lock
 .DS_Store
+*.crt
+*.key

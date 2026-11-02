@@ -16,6 +16,8 @@ set -uo pipefail
 
 BINDIR="${BINDIR:-./bin}"
 SERVER_BIN="$BINDIR/vaultnet_server"
+SERVER_BIN="$(cd "$(dirname "$SERVER_BIN")" && pwd)/$(basename "$SERVER_BIN")"
+WORK_DIR=$(mktemp -d)
 PORT=18081   # different port to avoid collision with other tests
 HOST="127.0.0.1"
 
@@ -39,16 +41,12 @@ send_cmds() {
 cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
+    rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
 # ── 1. Clean start ─────────────────────────────────────────────────────────────
-pkill -f "vaultnet_server $PORT" 2>/dev/null || true
-sleep 0.2
-rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
-
-"$SERVER_BIN" "$PORT" &
+(cd "$WORK_DIR" && exec "$SERVER_BIN" "$PORT") &
 SERVER_PID=$!
 sleep 0.6
 echo "Server started (PID $SERVER_PID)"
@@ -82,7 +80,7 @@ echo "Server killed."
 
 # ── 5. Restart ────────────────────────────────────────────────────────────────
 echo "Restarting server..."
-"$SERVER_BIN" "$PORT" &
+(cd "$WORK_DIR" && exec "$SERVER_BIN" "$PORT") &
 SERVER_PID=$!
 sleep 0.6
 echo "Server restarted (PID $SERVER_PID)"
@@ -106,9 +104,9 @@ else
     echo "  RESULT: FAIL – expected $EXPECTED_BAL, got ${BAL:-<none>}"
     echo ""
     echo "WAL/snapshot files:"
-    ls -la vaultnet.snap vaultnet.wal 2>/dev/null || true
+    ls -la "$WORK_DIR/vaultnet.snap" "$WORK_DIR/vaultnet.wal" 2>/dev/null || true
     echo "Snapshot contents:"
-    cat vaultnet.snap 2>/dev/null || true
+    cat "$WORK_DIR/vaultnet.snap" 2>/dev/null || true
     exit 1
 fi
 

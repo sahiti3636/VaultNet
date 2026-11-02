@@ -15,7 +15,10 @@ set -uo pipefail
 
 BINDIR="./bin"
 SERVER_BIN="$BINDIR/vaultnet_server"
-RESULT_DIR=$(mktemp -d)
+SERVER_BIN="$(cd "$(dirname "$SERVER_BIN")" && pwd)/$(basename "$SERVER_BIN")"
+WORK_DIR=$(mktemp -d)
+RESULT_DIR="$WORK_DIR/results"
+mkdir -p "$RESULT_DIR"
 PORT=18080
 HOST="127.0.0.1"
 SEED_AMOUNT=100000    # each account starts here
@@ -33,8 +36,7 @@ done
 cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
-    rm -rf "$RESULT_DIR"
+    rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
@@ -52,11 +54,7 @@ extract_balance() {
 }
 
 # ── 1. Start server ────────────────────────────────────────────────────────
-# Kill any stale server from a prior run before we try to bind the port
-pkill -f "vaultnet_server $PORT" 2>/dev/null || true
-sleep 0.2
-rm -f vaultnet.snap vaultnet.snap.tmp vaultnet.wal vaultnet_audit.log vaultnet.lock
-"$SERVER_BIN" "$PORT" &
+(cd "$WORK_DIR" && exec "$SERVER_BIN" "$PORT") &
 SERVER_PID=$!
 sleep 0.6
 
@@ -114,7 +112,7 @@ BOB_BAL=$(  extract_balance "$BOB_RESP")
 if [[ -z "$ALICE_BAL" || -z "$BOB_BAL" ]]; then
     echo "FATAL: could not read balances (alice='$ALICE_BAL' bob='$BOB_BAL')"
     echo "Server log:"
-    tail -30 vaultnet_audit.log 2>/dev/null || true
+    tail -30 "$WORK_DIR/vaultnet_audit.log" 2>/dev/null || true
     exit 1
 fi
 
@@ -159,7 +157,7 @@ fi
 
 echo ""
 echo "Last 20 audit log entries:"
-tail -20 vaultnet_audit.log 2>/dev/null || echo "(no log)"
+tail -20 "$WORK_DIR/vaultnet_audit.log" 2>/dev/null || echo "(no log)"
 
 echo ""
 echo "Test complete."

@@ -129,6 +129,7 @@ int main(int argc, char *argv[]) {
         }
 
         int quitting = (strcasecmp(line, "QUIT") == 0);
+        int history  = (strcasecmp(line, "HISTORY") == 0);
 
         for (;;) {
             n = vn_readline(&vc, line, sizeof(line));
@@ -138,8 +139,8 @@ int main(int argc, char *argv[]) {
             printf("< %s\n", line);
 
             if (strncmp(line, "END", 3) == 0) break;
-            if (strncmp(line, "OK",  2) == 0 ||
-                strncmp(line, "ERR", 3) == 0) break;
+            if (strncmp(line, "ERR", 3) == 0 ||
+                (!history && strncmp(line, "OK", 2) == 0)) break;
         }
 
         if (quitting) break;
