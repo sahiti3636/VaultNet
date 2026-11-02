@@ -1,0 +1,8 @@
+bin/
+obj/
+*.snap
+*.snap.tmp
+*.wal
+*.log
+*.lock
+.DS_Store
