@@ -46,6 +46,25 @@ static char g_snap_file[256];
 /* Op counter for checkpoint triggering */
 static atomic_uint_fast64_t g_op_count = 0;
 
+static int sync_snapshot_directory(void) {
+    char dir[sizeof(g_snap_file)];
+    const char *slash = strrchr(g_snap_file, '/');
+    if (slash) {
+        size_t len = (size_t)(slash - g_snap_file);
+        if (len >= sizeof(dir)) return -1;
+        if (len == 0) len = 1;
+        memcpy(dir, g_snap_file, len);
+        dir[len] = '\0';
+    } else {
+        strcpy(dir, ".");
+    }
+    int fd = open(dir, O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
 /* ── internal helpers ─────────────────────────────────────────────────────── */
 
 static Account *find_account_unlocked(const char *username) {
@@ -100,10 +119,13 @@ int accounts_checkpoint(void) {
     fclose(fp);
 
     if (rename(tmp, g_snap_file) < 0) { perror("checkpoint: rename"); return -1; }
+    if (sync_snapshot_directory() < 0) {
+        perror("checkpoint: fsync directory");
+        return -1;
+    }
 
     g_snap_lsn = snap_lsn;
-    wal_truncate();   /* empty the WAL; snapshot covers everything up to snap_lsn */
-    return 0;
+    return wal_truncate();
 }
 
 static int load_snapshot(void) {
@@ -165,7 +187,14 @@ static int load_snapshot(void) {
 /* ── lifecycle ─────────────────────────────────────────────────────────────── */
 
 int accounts_init(const char *snap_file) {
+    for (int i = 0; i < g_num_accounts; i++)
+        if (g_accounts[i].active) pthread_mutex_destroy(&g_accounts[i].lock);
+    g_num_accounts = 0;
+    g_next_id = 1;
+    g_snap_lsn = 0;
+    atomic_store(&g_op_count, 0);
     strncpy(g_snap_file, snap_file, sizeof(g_snap_file) - 1);
+    g_snap_file[sizeof(g_snap_file) - 1] = '\0';
     memset(g_accounts, 0, sizeof(g_accounts));
     return load_snapshot();
 }
@@ -181,9 +210,12 @@ void accounts_shutdown(void) {
 
     pthread_rwlock_wrlock(&g_reg_rwlock);
     for (int i = 0; i < g_num_accounts; i++) {
-        if (g_accounts[i].active)
+        if (g_accounts[i].active) {
             pthread_mutex_destroy(&g_accounts[i].lock);
+            g_accounts[i].active = 0;
+        }
     }
+    g_num_accounts = 0;
     pthread_rwlock_unlock(&g_reg_rwlock);
 }
 
