@@ -95,8 +95,7 @@ int audit_history(const char *username, int n, VNConn *conn) {
     while (scanned++ < HISTORY_SCAN_MAX && fgets(linebuf, sizeof(linebuf), rfp)) {
         /* Field 3 (0-based) is username: seq|ts|EVENT|username|... */
         char copy[AUDIT_LINE_MAX];
-        strncpy(copy, linebuf, sizeof(copy) - 1);
-        copy[sizeof(copy)-1] = '\0';
+        memcpy(copy, linebuf, strlen(linebuf) + 1);
 
         char *fields[8];
         int fi = 0;

@@ -260,7 +260,9 @@ static void handle_client(void *arg) {
             if (accounts_authenticate(user, pass)) {
                 failed_logins = 0;
                 logged_in = 1;
-                strncpy(session_user, user, MAX_USERNAME - 1);
+                size_t user_len = strnlen(user, MAX_USERNAME - 1);
+                memcpy(session_user, user, user_len);
+                session_user[user_len] = '\0';
                 audit_log("LOGIN", user, conn->peer_addr, 0, "OK");
                 vn_sendlinef(c, "OK logged in as %s", user);
             } else {

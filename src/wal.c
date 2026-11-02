@@ -72,9 +72,14 @@ static pthread_cond_t    g_space = PTHREAD_COND_INITIALIZER; /* writer → prod 
 static pthread_cond_t    g_flush = PTHREAD_COND_INITIALIZER; /* writer → prod (record durable) */
 
 static int                  g_wal_fd = -1;
-static char                 g_wal_path[256];
 static _Atomic uint64_t     g_last_lsn = 0;
 static pthread_t            g_writer_tid;
+
+static void copy_bounded(char *dst, size_t capacity, const char *src) {
+    size_t len = strnlen(src, capacity - 1);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
 
 /* ── Record builder ──────────────────────────────────────────────────────── */
 
@@ -91,10 +96,10 @@ static void build_record(WALRecord *r, WALType type,
     r->rec_size     = (uint16_t)sizeof(WALRecord);
     r->lsn          = lsn;
     r->account_id   = account_id;
-    if (u1)   strncpy(r->username1,    u1,   sizeof(r->username1) - 1);
-    if (u2)   strncpy(r->username2,    u2,   sizeof(r->username2) - 1);
-    if (hash) strncpy(r->password_hash, hash, sizeof(r->password_hash) - 1);
-    if (salt) strncpy(r->salt,         salt, sizeof(r->salt) - 1);
+    if (u1)   copy_bounded(r->username1, sizeof(r->username1), u1);
+    if (u2)   copy_bounded(r->username2, sizeof(r->username2), u2);
+    if (hash) copy_bounded(r->password_hash, sizeof(r->password_hash), hash);
+    if (salt) copy_bounded(r->salt, sizeof(r->salt), salt);
     r->amount_paise = amount;
     r->bal1_after   = b1;
     r->bal2_after   = b2;
@@ -159,7 +164,6 @@ static void *writer_thread(void *arg) {
 /* ── Public API ───────────────────────────────────────────────────────────── */
 
 int wal_init(const char *wal_path) {
-    strncpy(g_wal_path, wal_path, sizeof(g_wal_path) - 1);
     /* O_APPEND: every write goes to end regardless of concurrent truncates */
     g_wal_fd = open(wal_path, O_RDWR | O_CREAT | O_APPEND, 0600);
     if (g_wal_fd < 0) { perror("wal_init: open"); return -1; }

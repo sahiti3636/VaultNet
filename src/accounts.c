@@ -46,6 +46,12 @@ static char g_snap_file[256];
 /* Op counter for checkpoint triggering */
 static atomic_uint_fast64_t g_op_count = 0;
 
+static void copy_bounded(char *dst, size_t capacity, const char *src) {
+    size_t len = strnlen(src, capacity - 1);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static int sync_snapshot_directory(void) {
     char dir[sizeof(g_snap_file)];
     const char *slash = strrchr(g_snap_file, '/');
@@ -166,11 +172,11 @@ static int load_snapshot(void) {
         tok = strsep(&p, ":"); if (!tok) continue;
         a->account_id = (uint64_t)strtoull(tok, NULL, 10);
         tok = strsep(&p, ":"); if (!tok) continue;
-        strncpy(a->username, tok, MAX_USERNAME - 1);
+        copy_bounded(a->username, sizeof(a->username), tok);
         tok = strsep(&p, ":"); if (!tok) continue;
-        strncpy(a->password_hash, tok, MAX_HASH - 1);
+        copy_bounded(a->password_hash, sizeof(a->password_hash), tok);
         tok = strsep(&p, ":"); if (!tok) continue;
-        strncpy(a->salt, tok, SALT_HEX_LEN - 1);
+        copy_bounded(a->salt, sizeof(a->salt), tok);
         tok = strsep(&p, ":"); if (!tok) continue;
         a->balance_paise = (int64_t)strtoll(tok, NULL, 10);
 
@@ -193,8 +199,7 @@ int accounts_init(const char *snap_file) {
     g_next_id = 1;
     g_snap_lsn = 0;
     atomic_store(&g_op_count, 0);
-    strncpy(g_snap_file, snap_file, sizeof(g_snap_file) - 1);
-    g_snap_file[sizeof(g_snap_file) - 1] = '\0';
+    copy_bounded(g_snap_file, sizeof(g_snap_file), snap_file);
     memset(g_accounts, 0, sizeof(g_accounts));
     return load_snapshot();
 }
@@ -239,9 +244,9 @@ void accounts_apply_wal_record(const WALRecord *r) {
         Account *a = &g_accounts[g_num_accounts];
         memset(a, 0, sizeof(*a));
         a->account_id = r->account_id;
-        strncpy(a->username,     r->username1,     MAX_USERNAME - 1);
-        strncpy(a->password_hash, r->password_hash, MAX_HASH - 1);
-        strncpy(a->salt,         r->salt,          SALT_HEX_LEN - 1);
+        copy_bounded(a->username, sizeof(a->username), r->username1);
+        copy_bounded(a->password_hash, sizeof(a->password_hash), r->password_hash);
+        copy_bounded(a->salt, sizeof(a->salt), r->salt);
         a->balance_paise = 0;
         a->active = 1;
         pthread_mutex_init(&a->lock, NULL);
@@ -288,7 +293,7 @@ int accounts_register(const char *username, const char *password) {
     Account *a = &g_accounts[g_num_accounts];
     memset(a, 0, sizeof(*a));
     a->account_id    = g_next_id;
-    strncpy(a->username, username, MAX_USERNAME - 1);
+    copy_bounded(a->username, sizeof(a->username), username);
     if (generate_salt(a->salt, sizeof(a->salt)) != 0 ||
         hash_password(password, a->salt, a->password_hash,
                       sizeof(a->password_hash)) != 0) {
