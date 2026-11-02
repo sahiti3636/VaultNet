@@ -94,7 +94,8 @@ static void handle_signal(int sig) {
     g_running = 0;
     if (g_pipe[1] >= 0) {
         char b = 1;
-        (void)write(g_pipe[1], &b, 1);
+        ssize_t sent = write(g_pipe[1], &b, 1);
+        (void)sent;
     } else if (g_listen_fd >= 0) {
         close(g_listen_fd);
         g_listen_fd = -1;
